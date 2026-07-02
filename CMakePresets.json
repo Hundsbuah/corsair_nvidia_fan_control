@@ -1,0 +1,26 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "clang-7950x3d",
+      "displayName": "LLVM Clang Release for Ryzen 9 7950X3D",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+        "CMAKE_C_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+        "CMAKE_LINKER": "C:/Program Files/LLVM/bin/lld-link.exe",
+        "CMAKE_RC_COMPILER": "C:/Program Files/LLVM/bin/llvm-rc.exe",
+        "CMAKE_MT": "C:/Program Files/LLVM/bin/llvm-mt.exe"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "clang-7950x3d-release",
+      "configurePreset": "clang-7950x3d",
+      "configuration": "Release"
+    }
+  ]
+}
