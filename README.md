@@ -77,7 +77,9 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
    points. If the controller is open, `Save` also applies them immediately.
 7. Enable `Autostart` to create a per-user login entry. The stored command is
    `corsair_nvidia_fan_control.exe --tray`, so Windows starts it hidden in the
-   notification area next to the clock.
+   notification area next to the clock. The tool also updates Windows'
+   `StartupApproved` state and retries the tray icon if Explorer is not ready
+   yet during login.
 
 The Commander Pro stores hardware-side fan settings, so fixed values can keep
 running after the GUI exits. Reinitialize after boot, resume or USB reconnect.

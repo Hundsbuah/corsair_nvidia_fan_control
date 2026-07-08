@@ -15,6 +15,7 @@
 #define LEGACY_APP_RUN_VALUE L"CorsairFanControl"
 #define SETTINGS_KEY L"Software\\CorsairNvidiaFanControl"
 #define LEGACY_SETTINGS_KEY L"Software\\CorsairFanControl"
+#define STARTUP_APPROVED_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
 
 #define IDC_DEVICE_COMBO 100
 #define IDC_SCAN 101
@@ -36,7 +37,9 @@
 #define IDC_AUTOSTART 905
 #define IDC_SAVE_SETTINGS 906
 #define REFRESH_TIMER 1
+#define TRAY_RETRY_TIMER 2
 #define POLL_INTERVAL_MS 5000
+#define TRAY_RETRY_INTERVAL_MS 2000
 #define WM_TRAYICON (WM_APP + 1)
 #define TRAY_ICON_ID 1
 #define IDM_TRAY_OPEN 1000
@@ -79,8 +82,10 @@ typedef struct AppState {
     bool gpu_ok;
     bool saved_fan_setting[CORSAIR_FAN_COUNT];
     int last_nvidia_duty[CORSAIR_FAN_COUNT];
+    UINT taskbar_created_msg;
     bool start_in_tray;
     bool tray_added;
+    bool tray_icon_wanted;
     bool allow_close;
     bool opened;
 } AppState;
@@ -132,6 +137,49 @@ static bool autostart_command(wchar_t *cmd, DWORD cmd_len)
     return written > 0 && (DWORD)written < cmd_len;
 }
 
+static bool startup_approved_allows(void)
+{
+    HKEY key;
+    BYTE value[16] = { 0 };
+    DWORD type = 0;
+    DWORD bytes = sizeof(value);
+    bool allowed = true;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY,
+                      0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+        return true;
+    }
+
+    if (RegQueryValueExW(key, APP_RUN_VALUE, NULL, &type, value, &bytes) == ERROR_SUCCESS &&
+        type == REG_BINARY && bytes > 0) {
+        allowed = value[0] != 0x03;
+    }
+
+    RegCloseKey(key);
+    return allowed;
+}
+
+static void set_startup_approved_enabled(bool enabled)
+{
+    HKEY key;
+    LONG rc = RegCreateKeyExW(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY,
+                              0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
+    if (rc != ERROR_SUCCESS) {
+        return;
+    }
+
+    if (enabled) {
+        const BYTE value[12] = { 0x02, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0 };
+        RegSetValueExW(key, APP_RUN_VALUE, 0, REG_BINARY, value, sizeof(value));
+        RegDeleteValueW(key, LEGACY_APP_RUN_VALUE);
+    } else {
+        RegDeleteValueW(key, APP_RUN_VALUE);
+        RegDeleteValueW(key, LEGACY_APP_RUN_VALUE);
+    }
+
+    RegCloseKey(key);
+}
+
 static bool is_autostart_enabled(void)
 {
     HKEY key;
@@ -154,7 +202,7 @@ static bool is_autostart_enabled(void)
     if (RegQueryValueExW(key, APP_RUN_VALUE, NULL, &type, (LPBYTE)value, &bytes) == ERROR_SUCCESS &&
         type == REG_SZ) {
         value[(sizeof(value) / sizeof(value[0])) - 1] = L'\0';
-        enabled = wcscmp(value, expected) == 0;
+        enabled = wcscmp(value, expected) == 0 && startup_approved_allows();
     }
 
     RegCloseKey(key);
@@ -180,12 +228,16 @@ static bool set_autostart_enabled(bool enabled)
         rc = RegSetValueExW(key, APP_RUN_VALUE, 0, REG_SZ,
                             (const BYTE *)cmd, (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
         RegDeleteValueW(key, LEGACY_APP_RUN_VALUE);
+        if (rc == ERROR_SUCCESS) {
+            set_startup_approved_enabled(true);
+        }
     } else {
         rc = RegDeleteValueW(key, APP_RUN_VALUE);
         if (rc == ERROR_FILE_NOT_FOUND) {
             rc = ERROR_SUCCESS;
         }
         RegDeleteValueW(key, LEGACY_APP_RUN_VALUE);
+        set_startup_approved_enabled(false);
     }
 
     RegCloseKey(key);
@@ -476,7 +528,7 @@ static void save_settings(AppState *app)
     }
 }
 
-static void tray_update(AppState *app, DWORD message)
+static bool tray_update(AppState *app, DWORD message)
 {
     NOTIFYICONDATAW nid;
     ZeroMemory(&nid, sizeof(nid));
@@ -493,13 +545,30 @@ static void tray_update(AppState *app, DWORD message)
 
     if (Shell_NotifyIconW(message, &nid)) {
         app->tray_added = message != NIM_DELETE;
+        return true;
+    }
+    return false;
+}
+
+static void ensure_tray_icon(AppState *app)
+{
+    if (app->tray_added) {
+        KillTimer(app->hwnd, TRAY_RETRY_TIMER);
+        return;
+    }
+
+    if (tray_update(app, NIM_ADD)) {
+        KillTimer(app->hwnd, TRAY_RETRY_TIMER);
+    } else {
+        SetTimer(app->hwnd, TRAY_RETRY_TIMER, TRAY_RETRY_INTERVAL_MS, NULL);
     }
 }
 
 static void hide_to_tray(AppState *app)
 {
+    app->tray_icon_wanted = true;
     if (!app->tray_added) {
-        tray_update(app, NIM_ADD);
+        ensure_tray_icon(app);
     }
     ShowWindow(app->hwnd, SW_HIDE);
 }
@@ -1092,6 +1161,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 {
     AppState *app = &g_app;
 
+    if (app->taskbar_created_msg != 0 && msg == app->taskbar_created_msg) {
+        app->tray_added = false;
+        if (app->tray_icon_wanted) {
+            ensure_tray_icon(app);
+        }
+        return 0;
+    }
+
     switch (msg) {
     case WM_CREATE:
         app->hwnd = hwnd;
@@ -1174,6 +1251,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     case WM_TIMER:
         if (wparam == REFRESH_TIMER) {
             refresh_status(app);
+        } else if (wparam == TRAY_RETRY_TIMER) {
+            if (app->tray_icon_wanted && !app->tray_added) {
+                ensure_tray_icon(app);
+            } else {
+                KillTimer(hwnd, TRAY_RETRY_TIMER);
+            }
         }
         return 0;
 
@@ -1203,10 +1286,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
     case WM_DESTROY:
         KillTimer(hwnd, REFRESH_TIMER);
+        KillTimer(hwnd, TRAY_RETRY_TIMER);
         save_settings(app);
         if (app->tray_added) {
             tray_update(app, NIM_DELETE);
         }
+        app->tray_icon_wanted = false;
         if (app->opened) {
             corsair_close(&app->device);
             app->opened = false;
@@ -1232,6 +1317,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
         g_app.last_nvidia_duty[i] = -1;
     }
+    g_app.taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
     g_app.start_in_tray = strstr(cmd_line, "--tray") != NULL;
 
     icc.dwSize = sizeof(icc);
