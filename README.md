@@ -9,6 +9,8 @@ without iCUE. It uses the device's USB HID protocol directly and targets:
 ## Features
 
 - Detects and initializes all supported Corsair HID fan controllers.
+- Provides a live overview of fan RPM, modes, profiles, target duty, probe
+  temperatures, rail voltages, firmware and connection state for every controller.
 - Reads firmware, bootloader, fan modes, probe
   presence, RPM, temperatures and SATA rail voltages.
 - Applies fixed duty-cycle fan speeds per channel or to all connected channels.
@@ -69,13 +71,15 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 2. Start `corsair_nvidia_fan_control.exe`.
 3. Click `Scan` if needed. All detected controllers are opened and initialized;
    the device selection only chooses which controller is displayed and edited.
-4. Move a fan slider and click the row's `Apply`, or use `Apply all`.
-5. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is a
+4. Click `Overview` to see the cached live values from every controller in one
+   resizable window. The tables update with the five-second background poll.
+5. Move a fan slider and click the row's `Apply`, or use `Apply all`.
+6. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is a
    simple two-point interpolation from `Low C/%` to `High C/%`; defaults are
    `40 C -> 25%` and `80 C -> 100%`.
-6. Click `Save` to persist all current fan modes, fixed percentages and curve
+7. Click `Save` to persist all current fan modes, fixed percentages and curve
    points. If the controller is open, `Save` also applies them immediately.
-7. Enable `Autostart` to create a per-user login entry. The stored command is
+8. Enable `Autostart` to create a per-user login entry. The stored command is
    `corsair_nvidia_fan_control.exe --tray`, so Windows starts it hidden in the
    notification area next to the clock. The tool also updates Windows'
    `StartupApproved` state and retries the tray icon if Explorer is not ready

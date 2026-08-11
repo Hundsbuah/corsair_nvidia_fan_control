@@ -19,6 +19,7 @@
 
 #define IDC_DEVICE_COMBO 100
 #define IDC_SCAN 101
+#define IDC_OVERVIEW 102
 #define IDC_REFRESH 103
 #define IDC_APPLY_ALL 104
 #define IDC_STATUS 105
@@ -69,6 +70,7 @@ typedef struct AppState {
     HWND hwnd;
     HWND device_combo;
     HWND scan_btn;
+    HWND overview_btn;
     HWND refresh_btn;
     HWND apply_all_btn;
     HWND status_label;
@@ -86,6 +88,12 @@ typedef struct AppState {
     HWND gpu_duty_high_edit;
     HWND autostart_checkbox;
     HWND save_btn;
+    HWND overview_window;
+    HWND overview_gpu_label;
+    HWND overview_fan_heading;
+    HWND overview_fan_list;
+    HWND overview_sensor_heading;
+    HWND overview_sensor_list;
     CorsairDeviceInfo devices[CORSAIR_MAX_DEVICES];
     int device_count;
     int saved_device_index;
@@ -94,6 +102,8 @@ typedef struct AppState {
     ControllerRuntime controllers[CORSAIR_MAX_DEVICES];
     NvidiaGpuStatus gpu;
     bool gpu_ok;
+    SYSTEMTIME last_poll_time;
+    bool has_poll_time;
     UINT taskbar_created_msg;
     bool start_in_tray;
     bool tray_added;
@@ -114,6 +124,8 @@ static void save_device_settings_for_index(AppState *app, int device_index);
 static void open_selected_device(AppState *app);
 static void refresh_status(AppState *app);
 static void clear_device_status_view(AppState *app);
+static void update_overview_view(AppState *app);
+static LRESULT CALLBACK overview_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
 static void copy_wstr(wchar_t *dst, size_t dst_count, const wchar_t *src)
 {
@@ -617,6 +629,9 @@ static void hide_to_tray(AppState *app)
     if (!app->tray_added) {
         ensure_tray_icon(app);
     }
+    if (app->overview_window && IsWindow(app->overview_window)) {
+        ShowWindow(app->overview_window, SW_HIDE);
+    }
     ShowWindow(app->hwnd, SW_HIDE);
 }
 
@@ -1089,6 +1104,9 @@ static void scan_devices(AppState *app)
         update_controls_enabled(app);
         set_status_from_error(app, "Scan", err);
     }
+    GetLocalTime(&app->last_poll_time);
+    app->has_poll_time = true;
+    update_overview_view(app);
 }
 
 static void open_selected_device(AppState *app)
@@ -1191,6 +1209,9 @@ static void refresh_status(AppState *app)
         snprintf(context, sizeof(context), "Controller %d update", first_error_index + 1);
         set_status_from_error(app, context, first_error);
     }
+    GetLocalTime(&app->last_poll_time);
+    app->has_poll_time = true;
+    update_overview_view(app);
 }
 
 static bool apply_one(AppState *app, int device_index, int fan, char *err, size_t err_len)
@@ -1289,6 +1310,371 @@ static HWND make_child(HWND parent, const wchar_t *class_name, const wchar_t *te
                            GetModuleHandleW(NULL), NULL);
 }
 
+static const wchar_t *fan_profile_name(int mode_index)
+{
+    switch (mode_index) {
+    case FAN_MODE_PWM_INDEX:
+        return L"PWM";
+    case FAN_MODE_DC_INDEX:
+        return L"DC";
+    case FAN_MODE_OFF_INDEX:
+        return L"Off";
+    case FAN_MODE_NVIDIA_INDEX:
+        return L"NVIDIA";
+    default:
+        return L"Detected";
+    }
+}
+
+static void utf8_to_wide(const char *text, wchar_t *wide, int wide_count)
+{
+    if (!wide || wide_count <= 0) {
+        return;
+    }
+    if (!text || !text[0] ||
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, wide_count) <= 0) {
+        wide[0] = L'\0';
+    }
+    wide[wide_count - 1] = L'\0';
+}
+
+static void overview_add_column(HWND list, int index, const wchar_t *title, int width)
+{
+    LVCOLUMNW column;
+    ZeroMemory(&column, sizeof(column));
+    column.mask = LVCF_FMT | LVCF_TEXT | LVCF_WIDTH;
+    column.fmt = LVCFMT_LEFT;
+    column.pszText = (LPWSTR)title;
+    column.cx = width;
+    ListView_InsertColumn(list, index, &column);
+}
+
+static int overview_insert_row(HWND list, const wchar_t *text)
+{
+    LVITEMW item;
+    ZeroMemory(&item, sizeof(item));
+    item.mask = LVIF_TEXT;
+    item.iItem = ListView_GetItemCount(list);
+    item.pszText = (LPWSTR)text;
+    return ListView_InsertItem(list, &item);
+}
+
+static void overview_set_cell(HWND list, int row, int column, const wchar_t *text)
+{
+    ListView_SetItemText(list, row, column, (LPWSTR)text);
+}
+
+static void overview_set_row_count(HWND list, int row_count)
+{
+    int current = ListView_GetItemCount(list);
+    while (current > row_count) {
+        ListView_DeleteItem(list, --current);
+    }
+    while (current < row_count) {
+        overview_insert_row(list, L"");
+        ++current;
+    }
+}
+
+static void overview_controller_name(AppState *app, int device_index,
+                                     wchar_t *text, size_t text_count)
+{
+    swprintf(text, text_count, L"%d: %s (PID %04X)", device_index + 1,
+             app->devices[device_index].model, app->devices[device_index].product_id);
+}
+
+static void overview_target_text(AppState *app, int device_index, int fan,
+                                 wchar_t *text, size_t text_count)
+{
+    ControllerRuntime *controller = &app->controllers[device_index];
+    FanSettings *settings = &controller->fan[fan];
+
+    if (!settings->apply) {
+        copy_wstr(text, text_count, L"-");
+    } else if (settings->mode_index == FAN_MODE_OFF_INDEX) {
+        copy_wstr(text, text_count, L"Off");
+    } else if (settings->mode_index == FAN_MODE_NVIDIA_INDEX) {
+        int duty = controller->last_nvidia_duty[fan];
+        if (duty < 0 && app->gpu_ok) {
+            duty = nvidia_curve_duty(app);
+        }
+        if (duty >= 0) {
+            swprintf(text, text_count, L"%d%%", duty);
+        } else {
+            copy_wstr(text, text_count, L"N/A");
+        }
+    } else {
+        swprintf(text, text_count, L"%d%%", settings->duty_percent);
+    }
+}
+
+static void update_overview_view(AppState *app)
+{
+    if (!app->overview_window || !IsWindow(app->overview_window)) {
+        return;
+    }
+
+    SYSTEMTIME now = app->last_poll_time;
+    wchar_t text[512];
+    if (!app->has_poll_time) {
+        GetLocalTime(&now);
+    }
+    if (app->gpu_ok) {
+        wchar_t gpu_name[96];
+        utf8_to_wide(app->gpu.name, gpu_name, (int)(sizeof(gpu_name) / sizeof(gpu_name[0])));
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"%s | %d C | %d controllers | Updated %02d:%02d:%02d",
+                 gpu_name[0] ? gpu_name : L"NVIDIA GPU", app->gpu.temperature_c,
+                 app->device_count, now.wHour, now.wMinute, now.wSecond);
+    } else {
+        swprintf(text, sizeof(text) / sizeof(text[0]),
+                 L"NVIDIA GPU unavailable | %d controllers | Updated %02d:%02d:%02d",
+                 app->device_count, now.wHour, now.wMinute, now.wSecond);
+    }
+    SetWindowTextW(app->overview_gpu_label, text);
+
+    SendMessageW(app->overview_fan_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(app->overview_sensor_list, WM_SETREDRAW, FALSE, 0);
+    overview_set_row_count(app->overview_fan_list, app->device_count * CORSAIR_FAN_COUNT);
+    overview_set_row_count(app->overview_sensor_list, app->device_count);
+
+    for (int device_index = 0; device_index < app->device_count; ++device_index) {
+        ControllerRuntime *controller = &app->controllers[device_index];
+        wchar_t controller_name[256];
+        overview_controller_name(app, device_index, controller_name,
+                                 sizeof(controller_name) / sizeof(controller_name[0]));
+
+        for (int fan = 0; fan < CORSAIR_FAN_COUNT; ++fan) {
+            wchar_t fan_text[32];
+            wchar_t rpm_text[32];
+            wchar_t target_text[32];
+            swprintf(fan_text, sizeof(fan_text) / sizeof(fan_text[0]), L"Fan %d", fan + 1);
+
+            const wchar_t *hardware_mode = L"Unavailable";
+            if (controller->opened) {
+                hardware_mode = corsair_fan_mode_name(controller->device.status.fan_mode[fan]);
+                swprintf(rpm_text, sizeof(rpm_text) / sizeof(rpm_text[0]), L"%d rpm",
+                         controller->device.status.fan_rpm[fan]);
+            } else {
+                copy_wstr(rpm_text, sizeof(rpm_text) / sizeof(rpm_text[0]), L"-");
+            }
+            overview_target_text(app, device_index, fan, target_text,
+                                 sizeof(target_text) / sizeof(target_text[0]));
+
+            int row = device_index * CORSAIR_FAN_COUNT + fan;
+            overview_set_cell(app->overview_fan_list, row, 0, controller_name);
+            overview_set_cell(app->overview_fan_list, row, 1, fan_text);
+            overview_set_cell(app->overview_fan_list, row, 2, hardware_mode);
+            overview_set_cell(app->overview_fan_list, row, 3, rpm_text);
+            overview_set_cell(app->overview_fan_list, row, 4,
+                              fan_profile_name(controller->fan[fan].mode_index));
+            overview_set_cell(app->overview_fan_list, row, 5, target_text);
+        }
+
+        wchar_t state[320];
+        wchar_t firmware[64];
+        wchar_t bootloader[64];
+        if (controller->opened) {
+            if (controller->last_error[0]) {
+                wchar_t error[256];
+                utf8_to_wide(controller->last_error, error,
+                             (int)(sizeof(error) / sizeof(error[0])));
+                swprintf(state, sizeof(state) / sizeof(state[0]), L"Online: %s", error);
+            } else {
+                copy_wstr(state, sizeof(state) / sizeof(state[0]), L"Online");
+            }
+            swprintf(firmware, sizeof(firmware) / sizeof(firmware[0]), L"%d.%d.%d",
+                     controller->device.status.firmware[0],
+                     controller->device.status.firmware[1],
+                     controller->device.status.firmware[2]);
+            swprintf(bootloader, sizeof(bootloader) / sizeof(bootloader[0]), L"%d.%d",
+                     controller->device.status.bootloader[0],
+                     controller->device.status.bootloader[1]);
+        } else {
+            wchar_t error[256];
+            utf8_to_wide(controller->last_error, error,
+                         (int)(sizeof(error) / sizeof(error[0])));
+            swprintf(state, sizeof(state) / sizeof(state[0]), L"Offline%s%s",
+                     error[0] ? L": " : L"", error);
+            copy_wstr(firmware, sizeof(firmware) / sizeof(firmware[0]), L"-");
+            copy_wstr(bootloader, sizeof(bootloader) / sizeof(bootloader[0]), L"-");
+        }
+
+        int row = device_index;
+        overview_set_cell(app->overview_sensor_list, row, 0, controller_name);
+        overview_set_cell(app->overview_sensor_list, row, 1, state);
+        overview_set_cell(app->overview_sensor_list, row, 2, firmware);
+        overview_set_cell(app->overview_sensor_list, row, 3, bootloader);
+
+        for (int sensor = 0; sensor < CORSAIR_TEMP_COUNT; ++sensor) {
+            wchar_t sensor_text[32];
+            if (controller->opened && controller->device.status.temp_connected[sensor]) {
+                swprintf(sensor_text, sizeof(sensor_text) / sizeof(sensor_text[0]), L"%.1f C",
+                         controller->device.status.temp_c[sensor]);
+            } else {
+                copy_wstr(sensor_text, sizeof(sensor_text) / sizeof(sensor_text[0]), L"N/A");
+            }
+            overview_set_cell(app->overview_sensor_list, row, 4 + sensor, sensor_text);
+        }
+
+        for (int rail = 0; rail < CORSAIR_VOLT_COUNT; ++rail) {
+            wchar_t volt_text[32];
+            if (controller->opened) {
+                swprintf(volt_text, sizeof(volt_text) / sizeof(volt_text[0]), L"%.2f V",
+                         controller->device.status.volts[rail]);
+            } else {
+                copy_wstr(volt_text, sizeof(volt_text) / sizeof(volt_text[0]), L"N/A");
+            }
+            overview_set_cell(app->overview_sensor_list, row, 8 + rail, volt_text);
+        }
+    }
+
+    SendMessageW(app->overview_fan_list, WM_SETREDRAW, TRUE, 0);
+    SendMessageW(app->overview_sensor_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(app->overview_fan_list, NULL, TRUE);
+    InvalidateRect(app->overview_sensor_list, NULL, TRUE);
+}
+
+static void layout_overview_controls(AppState *app, int width, int height)
+{
+    const int margin = 12;
+    const int label_height = 22;
+    const int heading_height = 20;
+    const int gap = 8;
+    const int table_top = margin + label_height + heading_height + gap;
+    int available = height - table_top - margin - heading_height - gap;
+    int fan_height = (available * 2) / 3;
+    int sensor_heading_y = table_top + fan_height + gap;
+    int sensor_list_y = sensor_heading_y + heading_height;
+    int sensor_height = height - sensor_list_y - margin;
+
+    MoveWindow(app->overview_gpu_label, margin, margin, width - margin * 2, label_height, TRUE);
+    MoveWindow(app->overview_fan_heading, margin, margin + label_height,
+               width - margin * 2, heading_height, TRUE);
+    MoveWindow(app->overview_fan_list, margin, table_top,
+               width - margin * 2, fan_height, TRUE);
+    MoveWindow(app->overview_sensor_heading, margin, sensor_heading_y,
+               width - margin * 2, heading_height, TRUE);
+    MoveWindow(app->overview_sensor_list, margin, sensor_list_y,
+               width - margin * 2, sensor_height, TRUE);
+}
+
+static void create_overview_controls(AppState *app, HWND hwnd)
+{
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    app->overview_gpu_label = make_child(hwnd, WC_STATICW, L"GPU unavailable", SS_LEFT,
+                                         12, 12, 1000, 22, 0);
+    app->overview_fan_heading = make_child(hwnd, WC_STATICW, L"Fans", SS_LEFT,
+                                           12, 34, 1000, 20, 0);
+    app->overview_fan_list = CreateWindowExW(
+        WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+        12, 62, 1000, 400, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    app->overview_sensor_heading = make_child(hwnd, WC_STATICW, L"Sensors and controller status",
+                                              SS_LEFT, 12, 470, 1000, 20, 0);
+    app->overview_sensor_list = CreateWindowExW(
+        WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
+        12, 490, 1000, 140, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+
+    HWND controls[] = {
+        app->overview_gpu_label,
+        app->overview_fan_heading,
+        app->overview_fan_list,
+        app->overview_sensor_heading,
+        app->overview_sensor_list
+    };
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
+        SendMessageW(controls[i], WM_SETFONT, (WPARAM)font, TRUE);
+    }
+
+    ListView_SetExtendedListViewStyle(app->overview_fan_list,
+                                      LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    overview_add_column(app->overview_fan_list, 0, L"Controller", 270);
+    overview_add_column(app->overview_fan_list, 1, L"Channel", 65);
+    overview_add_column(app->overview_fan_list, 2, L"Hardware mode", 110);
+    overview_add_column(app->overview_fan_list, 3, L"Current RPM", 100);
+    overview_add_column(app->overview_fan_list, 4, L"Profile", 100);
+    overview_add_column(app->overview_fan_list, 5, L"Target", 80);
+
+    ListView_SetExtendedListViewStyle(app->overview_sensor_list,
+                                      LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    overview_add_column(app->overview_sensor_list, 0, L"Controller", 270);
+    overview_add_column(app->overview_sensor_list, 1, L"State", 220);
+    overview_add_column(app->overview_sensor_list, 2, L"Firmware", 85);
+    overview_add_column(app->overview_sensor_list, 3, L"Bootloader", 85);
+    overview_add_column(app->overview_sensor_list, 4, L"Temp 1", 75);
+    overview_add_column(app->overview_sensor_list, 5, L"Temp 2", 75);
+    overview_add_column(app->overview_sensor_list, 6, L"Temp 3", 75);
+    overview_add_column(app->overview_sensor_list, 7, L"Temp 4", 75);
+    overview_add_column(app->overview_sensor_list, 8, L"+12V", 75);
+    overview_add_column(app->overview_sensor_list, 9, L"+5V", 75);
+    overview_add_column(app->overview_sensor_list, 10, L"+3.3V", 75);
+}
+
+static void show_overview_window(AppState *app)
+{
+    if (app->overview_window && IsWindow(app->overview_window)) {
+        ShowWindow(app->overview_window, IsIconic(app->overview_window) ? SW_RESTORE : SW_SHOW);
+        SetForegroundWindow(app->overview_window);
+        update_overview_view(app);
+        return;
+    }
+
+    HWND hwnd = CreateWindowExW(
+        0, L"CorsairNvidiaFanControlOverview", APP_TITLE L" - All Controllers",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1240, 720,
+        app->hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!hwnd) {
+        set_status(app, L"Could not open controller overview.");
+        return;
+    }
+
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+}
+
+static LRESULT CALLBACK overview_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    AppState *app = &g_app;
+
+    switch (msg) {
+    case WM_CREATE:
+        app->overview_window = hwnd;
+        create_overview_controls(app, hwnd);
+        update_overview_view(app);
+        return 0;
+
+    case WM_SIZE:
+        if (wparam != SIZE_MINIMIZED) {
+            layout_overview_controls(app, LOWORD(lparam), HIWORD(lparam));
+        }
+        return 0;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *info = (MINMAXINFO *)lparam;
+        info->ptMinTrackSize.x = 800;
+        info->ptMinTrackSize.y = 520;
+        return 0;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        app->overview_window = NULL;
+        app->overview_gpu_label = NULL;
+        app->overview_fan_heading = NULL;
+        app->overview_fan_list = NULL;
+        app->overview_sensor_heading = NULL;
+        app->overview_sensor_list = NULL;
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
 static void create_controls(AppState *app, HWND hwnd)
 {
     app->device_combo = make_child(hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -1299,6 +1685,8 @@ static void create_controls(AppState *app, HWND hwnd)
                                   432, 12, 88, 26, IDC_REFRESH);
     app->apply_all_btn = make_child(hwnd, WC_BUTTONW, L"Apply all", BS_PUSHBUTTON,
                                     528, 12, 90, 26, IDC_APPLY_ALL);
+    app->overview_btn = make_child(hwnd, WC_BUTTONW, L"Overview", BS_PUSHBUTTON,
+                                   632, 12, 92, 26, IDC_OVERVIEW);
     app->autostart_checkbox = make_child(hwnd, WC_BUTTONW, L"Autostart", BS_AUTOCHECKBOX,
                                          632, 44, 92, 22, IDC_AUTOSTART);
     app->save_btn = make_child(hwnd, WC_BUTTONW, L"Save", BS_PUSHBUTTON,
@@ -1406,6 +1794,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             }
         } else if (id == IDC_SCAN) {
             scan_devices(app);
+        } else if (id == IDC_OVERVIEW) {
+            show_overview_window(app);
         } else if (id == IDC_REFRESH) {
             refresh_status(app);
         } else if (id == IDC_APPLY_ALL) {
@@ -1475,11 +1865,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 capture_device_settings(app, device_index);
                 app->controllers[device_index].fan[id - IDC_MODE_BASE].apply = true;
                 save_settings(app);
+                update_overview_view(app);
             }
         } else if ((id == IDC_GPU_TEMP_LOW || id == IDC_GPU_DUTY_LOW ||
                     id == IDC_GPU_TEMP_HIGH || id == IDC_GPU_DUTY_HIGH) &&
                    HIWORD(wparam) == EN_KILLFOCUS) {
             save_settings(app);
+            update_overview_view(app);
         }
         return 0;
     }
@@ -1494,6 +1886,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                         capture_device_settings(app, device_index);
                         app->controllers[device_index].fan[i].apply = true;
                         save_settings(app);
+                        update_overview_view(app);
                     }
                 }
                 break;
@@ -1545,6 +1938,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             tray_update(app, NIM_DELETE);
         }
         app->tray_icon_wanted = false;
+        if (app->overview_window && IsWindow(app->overview_window)) {
+            DestroyWindow(app->overview_window);
+        }
         close_all_controllers(app);
         PostQuitMessage(0);
         return 0;
@@ -1559,6 +1955,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 
     INITCOMMONCONTROLSEX icc;
     WNDCLASSW wc;
+    WNDCLASSW overview_wc;
     HWND hwnd;
     MSG msg;
 
@@ -1568,7 +1965,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     g_app.start_in_tray = strstr(cmd_line, "--tray") != NULL;
 
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
+    icc.dwICC = ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
 
     ZeroMemory(&wc, sizeof(wc));
@@ -1581,6 +1978,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 
     if (!RegisterClassW(&wc)) {
         MessageBoxW(NULL, L"Could not register window class.", APP_TITLE, MB_ICONERROR);
+        return 1;
+    }
+
+    overview_wc = wc;
+    overview_wc.lpfnWndProc = overview_wnd_proc;
+    overview_wc.lpszClassName = L"CorsairNvidiaFanControlOverview";
+    if (!RegisterClassW(&overview_wc)) {
+        MessageBoxW(NULL, L"Could not register overview window class.", APP_TITLE, MB_ICONERROR);
         return 1;
     }
 
