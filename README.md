@@ -8,13 +8,13 @@ without iCUE. It uses the device's USB HID protocol directly and targets:
 
 ## Features
 
-- Detects supported Corsair HID fan controllers.
-- Initializes the controller and reads firmware, bootloader, fan modes, probe
+- Detects and initializes all supported Corsair HID fan controllers.
+- Reads firmware, bootloader, fan modes, probe
   presence, RPM, temperatures and SATA rail voltages.
 - Applies fixed duty-cycle fan speeds per channel or to all connected channels.
 - Can force a fan channel mode to PWM, DC or Off when detection is wrong.
 - Reads the first NVIDIA GPU core temperature through NVAPI and can run a
-  simple two-point GPU-temperature fan curve.
+  simple two-point GPU-temperature fan curve across every detected controller.
 - Saves fan modes, fixed duty values, selected controller and GPU curve points
   and can reapply them automatically on startup.
 - Can register itself for login autostart and run minimized in the Windows
@@ -67,8 +67,8 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 
 1. Close Corsair iCUE and other tools that talk to the same controller.
 2. Start `corsair_nvidia_fan_control.exe`.
-3. Click `Scan` if needed and select a device. Selection automatically opens
-   and initializes the controller.
+3. Click `Scan` if needed. All detected controllers are opened and initialized;
+   the device selection only chooses which controller is displayed and edited.
 4. Move a fan slider and click the row's `Apply`, or use `Apply all`.
 5. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is a
    simple two-point interpolation from `Low C/%` to `High C/%`; defaults are
@@ -84,14 +84,15 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 The Commander Pro stores hardware-side fan settings, so fixed values can keep
 running after the GUI exits. Reinitialize after boot, resume or USB reconnect.
 The `NVIDIA` curve is software-driven and only updates while this tool is
-running. GPU temperature polling and curve updates run every 5 seconds. The GUI
-saves the selected controller and GPU curve points under
+running. GPU temperature polling and curve updates run every 5 seconds for all
+detected controllers, independently of the controller selected in the GUI.
+The GUI saves the selected controller and GPU curve points under
 `HKCU\Software\CorsairNvidiaFanControl`; fan mode selections, fixed duty values
 and fan auto-apply flags are stored per physical controller under
 `HKCU\Software\CorsairNvidiaFanControl\Devices\<device-key>`. Existing settings
 from the older `HKCU\Software\CorsairFanControl` key are read as a compatibility
-fallback. On `--tray` autostart it opens the saved controller and reapplies that
-controller's saved settings automatically.
+fallback. On `--tray` autostart it opens every detected controller and reapplies
+each controller's own saved settings automatically.
 
 Minimizing or closing the window hides it to the tray. Double-click the tray
 icon to restore it, or right-click the icon and choose `Exit` to stop the

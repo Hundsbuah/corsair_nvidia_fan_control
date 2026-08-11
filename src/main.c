@@ -51,6 +51,20 @@
 #define FAN_MODE_OFF_INDEX 3
 #define FAN_MODE_NVIDIA_INDEX 4
 
+typedef struct FanSettings {
+    int mode_index;
+    int duty_percent;
+    bool apply;
+} FanSettings;
+
+typedef struct ControllerRuntime {
+    CorsairDevice device;
+    FanSettings fan[CORSAIR_FAN_COUNT];
+    int last_nvidia_duty[CORSAIR_FAN_COUNT];
+    char last_error[256];
+    bool opened;
+} ControllerRuntime;
+
 typedef struct AppState {
     HWND hwnd;
     HWND device_combo;
@@ -77,17 +91,14 @@ typedef struct AppState {
     int saved_device_index;
     int active_device_index;
     wchar_t last_device_key[32];
-    CorsairDevice device;
+    ControllerRuntime controllers[CORSAIR_MAX_DEVICES];
     NvidiaGpuStatus gpu;
     bool gpu_ok;
-    bool saved_fan_setting[CORSAIR_FAN_COUNT];
-    int last_nvidia_duty[CORSAIR_FAN_COUNT];
     UINT taskbar_created_msg;
     bool start_in_tray;
     bool tray_added;
     bool tray_icon_wanted;
     bool allow_close;
-    bool opened;
 } AppState;
 
 static AppState g_app;
@@ -97,11 +108,12 @@ static int edit_int(HWND edit, int fallback);
 static int clamp_int(int value, int min_value, int max_value);
 static int slider_duty(AppState *app, int fan);
 static void update_duty_label(AppState *app, int fan);
-static bool apply_one(AppState *app, int fan, char *err, size_t err_len);
-static bool apply_saved_fan_settings(AppState *app, char *err, size_t err_len);
+static bool apply_one(AppState *app, int device_index, int fan, char *err, size_t err_len);
+static bool apply_saved_fan_settings(AppState *app, int device_index, char *err, size_t err_len);
 static void save_device_settings_for_index(AppState *app, int device_index);
 static void open_selected_device(AppState *app);
 static void refresh_status(AppState *app);
+static void clear_device_status_view(AppState *app);
 
 static void copy_wstr(wchar_t *dst, size_t dst_count, const wchar_t *src)
 {
@@ -374,18 +386,48 @@ static void set_edit_int(HWND edit, int value)
     SetWindowTextW(edit, text);
 }
 
-static void reset_fan_setting_controls(AppState *app)
+static void reset_controller_settings(ControllerRuntime *controller)
 {
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-        SendMessageW(app->fan_mode[i], CB_SETCURSEL, FAN_MODE_DETECTED_INDEX, 0);
-        SendMessageW(app->fan_slider[i], TBM_SETPOS, TRUE, 50);
+        controller->fan[i].mode_index = FAN_MODE_DETECTED_INDEX;
+        controller->fan[i].duty_percent = 50;
+        controller->fan[i].apply = false;
+        controller->last_nvidia_duty[i] = -1;
+    }
+    controller->last_error[0] = '\0';
+}
+
+static void show_device_settings(AppState *app, int device_index)
+{
+    if (device_index < 0 || device_index >= app->device_count) {
+        return;
+    }
+
+    ControllerRuntime *controller = &app->controllers[device_index];
+    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+        SendMessageW(app->fan_mode[i], CB_SETCURSEL, controller->fan[i].mode_index, 0);
+        SendMessageW(app->fan_slider[i], TBM_SETPOS, TRUE, controller->fan[i].duty_percent);
         update_duty_label(app, i);
-        app->saved_fan_setting[i] = false;
-        app->last_nvidia_duty[i] = -1;
     }
 }
 
-static bool load_fan_settings_from_key(AppState *app, HKEY key)
+static void capture_device_settings(AppState *app, int device_index)
+{
+    if (device_index < 0 || device_index >= app->device_count ||
+        device_index != app->active_device_index) {
+        return;
+    }
+
+    ControllerRuntime *controller = &app->controllers[device_index];
+    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+        LRESULT mode = SendMessageW(app->fan_mode[i], CB_GETCURSEL, 0, 0);
+        controller->fan[i].mode_index =
+            mode == CB_ERR ? FAN_MODE_DETECTED_INDEX : clamp_int((int)mode, 0, FAN_MODE_NVIDIA_INDEX);
+        controller->fan[i].duty_percent = clamp_int(slider_duty(app, i), 0, 100);
+    }
+}
+
+static bool load_fan_settings_from_key(ControllerRuntime *controller, HKEY key)
 {
     bool any = false;
 
@@ -396,7 +438,7 @@ static bool load_fan_settings_from_key(AppState *app, HKEY key)
         swprintf(name, sizeof(name) / sizeof(name[0]), L"FanMode%d", i);
         bool mode_exists = settings_try_read_dword(key, name, &mode);
         if (mode_exists && mode <= FAN_MODE_NVIDIA_INDEX) {
-            SendMessageW(app->fan_mode[i], CB_SETCURSEL, mode, 0);
+            controller->fan[i].mode_index = (int)mode;
             any = true;
         }
 
@@ -404,9 +446,7 @@ static bool load_fan_settings_from_key(AppState *app, HKEY key)
         DWORD duty_value = 50;
         bool duty_exists = settings_try_read_dword(key, name, &duty_value);
         if (duty_exists) {
-            int duty = clamp_int((int)duty_value, 0, 100);
-            SendMessageW(app->fan_slider[i], TBM_SETPOS, TRUE, duty);
-            update_duty_label(app, i);
+            controller->fan[i].duty_percent = clamp_int((int)duty_value, 0, 100);
             any = true;
         }
 
@@ -414,10 +454,10 @@ static bool load_fan_settings_from_key(AppState *app, HKEY key)
         DWORD apply_value = 0;
         bool apply_exists = settings_try_read_dword(key, name, &apply_value);
         if (apply_exists) {
-            app->saved_fan_setting[i] = apply_value != 0;
+            controller->fan[i].apply = apply_value != 0;
             any = true;
         } else if (mode_exists || duty_exists) {
-            app->saved_fan_setting[i] =
+            controller->fan[i].apply =
                 mode == FAN_MODE_NVIDIA_INDEX || mode == FAN_MODE_OFF_INDEX || duty_exists;
         }
     }
@@ -449,22 +489,23 @@ static void load_global_settings(AppState *app)
 static void load_device_settings(AppState *app, int device_index)
 {
     HKEY key;
-    reset_fan_setting_controls(app);
+    ControllerRuntime *controller = &app->controllers[device_index];
+    reset_controller_settings(controller);
 
     bool loaded = false;
     if (settings_open_device_key_for_index(app, device_index, &key, KEY_QUERY_VALUE)) {
-        loaded = load_fan_settings_from_key(app, key);
+        loaded = load_fan_settings_from_key(controller, key);
         RegCloseKey(key);
     }
     if (!loaded && settings_open_legacy_device_key_for_index(app, device_index, &key, KEY_QUERY_VALUE)) {
-        loaded = load_fan_settings_from_key(app, key);
+        loaded = load_fan_settings_from_key(controller, key);
         RegCloseKey(key);
     }
 
     if (!loaded && settings_open_existing_key(LEGACY_SETTINGS_KEY, &key, KEY_QUERY_VALUE)) {
         int legacy_device_index = (int)settings_read_dword(key, L"DeviceIndex", -1);
         if (legacy_device_index == device_index) {
-            load_fan_settings_from_key(app, key);
+            load_fan_settings_from_key(controller, key);
         }
         RegCloseKey(key);
     }
@@ -498,22 +539,28 @@ static void save_global_settings(AppState *app)
 
 static void save_device_settings_for_index(AppState *app, int device_index)
 {
+    if (device_index < 0 || device_index >= app->device_count) {
+        return;
+    }
+
+    capture_device_settings(app, device_index);
+
     HKEY key;
     if (!settings_open_device_key_for_index(app, device_index, &key, KEY_SET_VALUE)) {
         return;
     }
 
+    ControllerRuntime *controller = &app->controllers[device_index];
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
         wchar_t name[32];
-        LRESULT mode = SendMessageW(app->fan_mode[i], CB_GETCURSEL, 0, 0);
         swprintf(name, sizeof(name) / sizeof(name[0]), L"FanMode%d", i);
-        settings_write_dword(key, name, mode == CB_ERR ? FAN_MODE_DETECTED_INDEX : (DWORD)mode);
+        settings_write_dword(key, name, (DWORD)controller->fan[i].mode_index);
 
         swprintf(name, sizeof(name) / sizeof(name[0]), L"FanDuty%d", i);
-        settings_write_dword(key, name, (DWORD)clamp_int(slider_duty(app, i), 0, 100));
+        settings_write_dword(key, name, (DWORD)controller->fan[i].duty_percent);
 
         swprintf(name, sizeof(name) / sizeof(name[0]), L"FanApply%d", i);
-        settings_write_dword(key, name, app->saved_fan_setting[i] ? 1u : 0u);
+        settings_write_dword(key, name, controller->fan[i].apply ? 1u : 0u);
     }
 
     RegCloseKey(key);
@@ -625,10 +672,9 @@ static int slider_duty(AppState *app, int fan)
     return (int)SendMessageW(app->fan_slider[fan], TBM_GETPOS, 0, 0);
 }
 
-static CorsairFanMode selected_mode(AppState *app, int fan)
+static CorsairFanMode configured_mode(ControllerRuntime *controller, int fan)
 {
-    LRESULT index = SendMessageW(app->fan_mode[fan], CB_GETCURSEL, 0, 0);
-    switch (index) {
+    switch (controller->fan[fan].mode_index) {
     case FAN_MODE_PWM_INDEX:
         return CORSAIR_FAN_PWM;
     case FAN_MODE_DC_INDEX:
@@ -636,13 +682,13 @@ static CorsairFanMode selected_mode(AppState *app, int fan)
     case FAN_MODE_OFF_INDEX:
         return CORSAIR_FAN_DISCONNECTED;
     default:
-        return (CorsairFanMode)app->device.status.fan_mode[fan];
+        return (CorsairFanMode)controller->device.status.fan_mode[fan];
     }
 }
 
-static bool fan_uses_nvidia_curve(AppState *app, int fan)
+static bool fan_uses_nvidia_curve(const ControllerRuntime *controller, int fan)
 {
-    return SendMessageW(app->fan_mode[fan], CB_GETCURSEL, 0, 0) == FAN_MODE_NVIDIA_INDEX;
+    return controller->fan[fan].mode_index == FAN_MODE_NVIDIA_INDEX;
 }
 
 static int edit_int(HWND edit, int fallback)
@@ -696,7 +742,10 @@ static int nvidia_curve_duty(AppState *app)
 
 static void update_controls_enabled(AppState *app)
 {
-    BOOL opened = app->opened ? TRUE : FALSE;
+    BOOL opened = FALSE;
+    if (app->active_device_index >= 0 && app->active_device_index < app->device_count) {
+        opened = app->controllers[app->active_device_index].opened ? TRUE : FALSE;
+    }
     EnableWindow(app->refresh_btn, opened);
     EnableWindow(app->apply_all_btn, opened);
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
@@ -736,56 +785,86 @@ static void refresh_gpu_status(AppState *app)
     update_gpu_status_view(app, err);
 }
 
-static void apply_nvidia_curve(AppState *app)
+static bool apply_nvidia_curve_to_controller(AppState *app, int device_index,
+                                              char *err, size_t err_len)
 {
-    char err[256] = { 0 };
-
-    if (!app->opened || !app->gpu_ok) {
-        return;
+    if (device_index < 0 || device_index >= app->device_count) {
+        snprintf(err, err_len, "Invalid controller index.");
+        return false;
     }
 
+    ControllerRuntime *controller = &app->controllers[device_index];
+    if (!controller->opened || !app->gpu_ok) {
+        return true;
+    }
+
+    bool ok = true;
     int duty = nvidia_curve_duty(app);
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-        if (!fan_uses_nvidia_curve(app, i)) {
-            app->last_nvidia_duty[i] = -1;
+        if (!fan_uses_nvidia_curve(controller, i)) {
+            controller->last_nvidia_duty[i] = -1;
             continue;
         }
 
-        if (app->device.status.fan_mode[i] != CORSAIR_FAN_PWM &&
-            app->device.status.fan_mode[i] != CORSAIR_FAN_DC) {
+        if (controller->device.status.fan_mode[i] != CORSAIR_FAN_PWM &&
+            controller->device.status.fan_mode[i] != CORSAIR_FAN_DC) {
+            controller->last_nvidia_duty[i] = -1;
             continue;
         }
 
-        if (app->last_nvidia_duty[i] == duty) {
+        if (controller->last_nvidia_duty[i] == duty) {
             continue;
         }
 
-        if (!corsair_set_fan_duty(&app->device, i, duty, err, sizeof(err))) {
-            set_status_from_error(app, "NVIDIA curve", err);
+        char fan_err[256] = { 0 };
+        if (!corsair_set_fan_duty(&controller->device, i, duty, fan_err, sizeof(fan_err))) {
+            ok = false;
+            snprintf(err, err_len, "Fan %d: %s", i + 1, fan_err);
             continue;
         }
 
-        app->last_nvidia_duty[i] = duty;
-        SendMessageW(app->fan_slider[i], TBM_SETPOS, TRUE, duty);
-        update_duty_label(app, i);
+        controller->last_nvidia_duty[i] = duty;
+        if (device_index == app->active_device_index) {
+            SendMessageW(app->fan_slider[i], TBM_SETPOS, TRUE, duty);
+            update_duty_label(app, i);
+        }
     }
+
+    return ok;
 }
 
 static void update_status_view(AppState *app)
 {
     wchar_t text[256];
+    int device_index = app->active_device_index;
+
+    if (device_index < 0 || device_index >= app->device_count) {
+        return;
+    }
+
+    ControllerRuntime *controller = &app->controllers[device_index];
+    if (!controller->opened) {
+        clear_device_status_view(app);
+        if (controller->last_error[0]) {
+            set_status_from_error(app, "Controller", controller->last_error);
+        } else {
+            set_status(app, L"Controller is not open.");
+        }
+        return;
+    }
 
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
         swprintf(text, sizeof(text) / sizeof(text[0]),
                  L"%s / %d rpm",
-                 corsair_fan_mode_name(app->device.status.fan_mode[i]),
-                 app->device.status.fan_rpm[i]);
+                 corsair_fan_mode_name(controller->device.status.fan_mode[i]),
+                 controller->device.status.fan_rpm[i]);
         SetWindowTextW(app->fan_rpm[i], text);
     }
 
     for (int i = 0; i < CORSAIR_TEMP_COUNT; ++i) {
-        if (app->device.status.temp_connected[i]) {
-            swprintf(text, sizeof(text) / sizeof(text[0]), L"T%d: %.1f C", i + 1, app->device.status.temp_c[i]);
+        if (controller->device.status.temp_connected[i]) {
+            swprintf(text, sizeof(text) / sizeof(text[0]), L"T%d: %.1f C", i + 1,
+                     controller->device.status.temp_c[i]);
         } else {
             swprintf(text, sizeof(text) / sizeof(text[0]), L"T%d: N/A", i + 1);
         }
@@ -794,16 +873,17 @@ static void update_status_view(AppState *app)
 
     static const wchar_t *rail_names[CORSAIR_VOLT_COUNT] = { L"+12V", L"+5V", L"+3.3V" };
     for (int i = 0; i < CORSAIR_VOLT_COUNT; ++i) {
-        swprintf(text, sizeof(text) / sizeof(text[0]), L"%s: %.2f V", rail_names[i], app->device.status.volts[i]);
+        swprintf(text, sizeof(text) / sizeof(text[0]), L"%s: %.2f V", rail_names[i],
+                 controller->device.status.volts[i]);
         SetWindowTextW(app->volt_label[i], text);
     }
 
     swprintf(text, sizeof(text) / sizeof(text[0]), L"Firmware %d.%d.%d, Bootloader %d.%d",
-             app->device.status.firmware[0],
-             app->device.status.firmware[1],
-             app->device.status.firmware[2],
-             app->device.status.bootloader[0],
-             app->device.status.bootloader[1]);
+             controller->device.status.firmware[0],
+             controller->device.status.firmware[1],
+             controller->device.status.firmware[2],
+             controller->device.status.bootloader[0],
+             controller->device.status.bootloader[1]);
     set_status(app, text);
 }
 
@@ -814,7 +894,6 @@ static void clear_device_status_view(AppState *app)
 
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
         SetWindowTextW(app->fan_rpm[i], L"N/A / 0 rpm");
-        app->last_nvidia_duty[i] = -1;
     }
     for (int i = 0; i < CORSAIR_TEMP_COUNT; ++i) {
         swprintf(text, sizeof(text) / sizeof(text[0]), L"T%d: N/A", i + 1);
@@ -826,16 +905,27 @@ static void clear_device_status_view(AppState *app)
     }
 }
 
-static void close_open_device(AppState *app)
+static void close_controller(AppState *app, int device_index)
 {
-    if (!app->opened) {
+    if (device_index < 0 || device_index >= app->device_count) {
         return;
     }
 
-    corsair_close(&app->device);
-    app->opened = false;
-    clear_device_status_view(app);
-    update_controls_enabled(app);
+    ControllerRuntime *controller = &app->controllers[device_index];
+    if (controller->opened) {
+        corsair_close(&controller->device);
+        controller->opened = false;
+    }
+    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+        controller->last_nvidia_duty[i] = -1;
+    }
+}
+
+static void close_all_controllers(AppState *app)
+{
+    for (int i = 0; i < app->device_count; ++i) {
+        close_controller(app, i);
+    }
 }
 
 static void activate_device_selection(AppState *app, int device_index, bool save_previous)
@@ -852,36 +942,38 @@ static void activate_device_selection(AppState *app, int device_index, bool save
         save_device_settings_for_index(app, previous);
     }
 
-    if (previous != device_index) {
-        close_open_device(app);
-    }
-
     SendMessageW(app->device_combo, CB_SETCURSEL, device_index, 0);
     app->active_device_index = device_index;
-    load_device_settings(app, device_index);
+    show_device_settings(app, device_index);
     clear_device_status_view(app);
     update_controls_enabled(app);
     save_global_settings(app);
-    set_status(app, L"Device selected.");
+    if (app->controllers[device_index].opened) {
+        update_status_view(app);
+    } else {
+        set_status(app, L"Controller selected; opening it now.");
+    }
 }
 
-static bool apply_saved_fan_settings(AppState *app, char *err, size_t err_len)
+static bool apply_saved_fan_settings(AppState *app, int device_index, char *err, size_t err_len)
 {
     bool ok = true;
     char last_err[256] = { 0 };
 
-    if (!app->opened) {
-        snprintf(err, err_len, "Select an initialized device first.");
+    if (device_index < 0 || device_index >= app->device_count ||
+        !app->controllers[device_index].opened) {
+        snprintf(err, err_len, "Controller is not initialized.");
         return false;
     }
 
+    ControllerRuntime *controller = &app->controllers[device_index];
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-        if (!app->saved_fan_setting[i]) {
+        if (!controller->fan[i].apply) {
             continue;
         }
 
         char fan_err[256] = { 0 };
-        if (!apply_one(app, i, fan_err, sizeof(fan_err))) {
+        if (!apply_one(app, device_index, i, fan_err, sizeof(fan_err))) {
             ok = false;
             snprintf(last_err, sizeof(last_err), "Fan %d: %s", i + 1, fan_err);
         }
@@ -893,6 +985,43 @@ static bool apply_saved_fan_settings(AppState *app, char *err, size_t err_len)
     return ok;
 }
 
+static bool open_controller(AppState *app, int device_index, char *err, size_t err_len)
+{
+    if (device_index < 0 || device_index >= app->device_count) {
+        snprintf(err, err_len, "Invalid controller index.");
+        return false;
+    }
+
+    ControllerRuntime *controller = &app->controllers[device_index];
+    if (controller->opened) {
+        return true;
+    }
+
+    controller->last_error[0] = '\0';
+    if (!corsair_open(&controller->device, &app->devices[device_index], err, err_len)) {
+        snprintf(controller->last_error, sizeof(controller->last_error), "%s", err);
+        return false;
+    }
+
+    if (!corsair_initialize(&controller->device, err, err_len)) {
+        snprintf(controller->last_error, sizeof(controller->last_error), "%s", err);
+        corsair_close(&controller->device);
+        return false;
+    }
+
+    controller->opened = true;
+    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+        controller->last_nvidia_duty[i] = -1;
+    }
+
+    char apply_err[256] = { 0 };
+    if (!apply_saved_fan_settings(app, device_index, apply_err, sizeof(apply_err))) {
+        snprintf(controller->last_error, sizeof(controller->last_error), "%s", apply_err);
+    }
+
+    return true;
+}
+
 static void scan_devices(AppState *app)
 {
     char err[256] = { 0 };
@@ -902,13 +1031,15 @@ static void scan_devices(AppState *app)
         save_device_settings_for_index(app, app->active_device_index);
     }
     save_global_settings(app);
-    close_open_device(app);
+    close_all_controllers(app);
 
     SendMessageW(app->device_combo, CB_RESETCONTENT, 0, 0);
+    ZeroMemory(app->controllers, sizeof(app->controllers));
     app->device_count = corsair_find_devices(app->devices, CORSAIR_MAX_DEVICES, err, sizeof(err));
     app->active_device_index = -1;
 
     for (int i = 0; i < app->device_count; ++i) {
+        load_device_settings(app, i);
         swprintf(item, sizeof(item) / sizeof(item[0]), L"%s (PID %04X)",
                  app->devices[i].model, app->devices[i].product_id);
         SendMessageW(app->device_combo, CB_ADDSTRING, 0, (LPARAM)item);
@@ -920,7 +1051,39 @@ static void scan_devices(AppState *app)
             selected = clamp_int(app->saved_device_index, 0, app->device_count - 1);
         }
         activate_device_selection(app, selected, false);
-        open_selected_device(app);
+        refresh_gpu_status(app);
+
+        int opened_count = 0;
+        int error_count = 0;
+        char first_error[256] = { 0 };
+        for (int i = 0; i < app->device_count; ++i) {
+            char open_err[256] = { 0 };
+            if (open_controller(app, i, open_err, sizeof(open_err))) {
+                ++opened_count;
+                if (app->controllers[i].last_error[0]) {
+                    ++error_count;
+                    if (!first_error[0]) {
+                        snprintf(first_error, sizeof(first_error), "Controller %d: %s",
+                                 i + 1, app->controllers[i].last_error);
+                    }
+                }
+            } else {
+                ++error_count;
+                if (!first_error[0]) {
+                    snprintf(first_error, sizeof(first_error), "Controller %d: %s", i + 1, open_err);
+                }
+            }
+        }
+
+        update_controls_enabled(app);
+        update_status_view(app);
+        if (error_count > 0) {
+            set_status_from_error(app, "Not all controllers were updated", first_error);
+        } else {
+            swprintf(item, sizeof(item) / sizeof(item[0]),
+                     L"%d of %d controllers initialized and updated.", opened_count, app->device_count);
+            set_status(app, item);
+        }
     } else {
         clear_device_status_view(app);
         update_controls_enabled(app);
@@ -942,81 +1105,131 @@ static void open_selected_device(AppState *app)
         activate_device_selection(app, index, true);
     }
 
-    if (app->opened && index == app->active_device_index) {
-        refresh_status(app);
+    ControllerRuntime *controller = &app->controllers[index];
+    if (controller->opened) {
+        update_controls_enabled(app);
+        update_status_view(app);
         return;
-    }
-
-    if (app->opened) {
-        close_open_device(app);
     }
 
     app->active_device_index = index;
     save_global_settings(app);
     set_status(app, L"Opening selected device...");
 
-    if (!corsair_open(&app->device, &app->devices[index], err, sizeof(err))) {
+    refresh_gpu_status(app);
+    if (!open_controller(app, index, err, sizeof(err))) {
         set_status_from_error(app, "Open", err);
         update_controls_enabled(app);
         return;
     }
 
-    app->opened = true;
     update_controls_enabled(app);
-
-    if (!corsair_initialize(&app->device, err, sizeof(err))) {
-        close_open_device(app);
-        set_status_from_error(app, "Initialize", err);
-        return;
-    }
-
     update_status_view(app);
-    refresh_gpu_status(app);
-    if (!apply_saved_fan_settings(app, err, sizeof(err))) {
-        set_status_from_error(app, "Apply saved", err);
+    if (controller->last_error[0]) {
+        set_status_from_error(app, "Apply saved", controller->last_error);
     }
-    SetTimer(app->hwnd, REFRESH_TIMER, POLL_INTERVAL_MS, NULL);
 }
 
 static void refresh_status(AppState *app)
 {
-    char err[256] = { 0 };
-    if (!app->opened) {
-        refresh_gpu_status(app);
-        return;
+    refresh_gpu_status(app);
+
+    char first_error[256] = { 0 };
+    int first_error_index = -1;
+    for (int i = 0; i < app->device_count; ++i) {
+        ControllerRuntime *controller = &app->controllers[i];
+        bool newly_opened = false;
+        bool controller_ok = true;
+        char err[256] = { 0 };
+
+        if (!controller->opened) {
+            if (!open_controller(app, i, err, sizeof(err))) {
+                if (first_error_index < 0) {
+                    first_error_index = i;
+                    snprintf(first_error, sizeof(first_error), "%s", err);
+                }
+                continue;
+            }
+            newly_opened = true;
+            if (controller->last_error[0]) {
+                controller_ok = false;
+                if (first_error_index < 0) {
+                    first_error_index = i;
+                    snprintf(first_error, sizeof(first_error), "%s", controller->last_error);
+                }
+            }
+        }
+
+        if (!newly_opened && !corsair_refresh(&controller->device, err, sizeof(err))) {
+            snprintf(controller->last_error, sizeof(controller->last_error), "%s", err);
+            if (first_error_index < 0) {
+                first_error_index = i;
+                snprintf(first_error, sizeof(first_error), "%s", err);
+            }
+            close_controller(app, i);
+            continue;
+        }
+
+        if (!apply_nvidia_curve_to_controller(app, i, err, sizeof(err))) {
+            snprintf(controller->last_error, sizeof(controller->last_error), "%s", err);
+            controller_ok = false;
+            if (first_error_index < 0) {
+                first_error_index = i;
+                snprintf(first_error, sizeof(first_error), "%s", err);
+            }
+        }
+
+        if (controller_ok) {
+            controller->last_error[0] = '\0';
+        }
     }
 
-    refresh_gpu_status(app);
-    if (!corsair_refresh(&app->device, err, sizeof(err))) {
-        set_status_from_error(app, "Refresh", err);
-        return;
-    }
+    update_controls_enabled(app);
     update_status_view(app);
-    apply_nvidia_curve(app);
+    if (first_error_index >= 0) {
+        char context[64];
+        snprintf(context, sizeof(context), "Controller %d update", first_error_index + 1);
+        set_status_from_error(app, context, first_error);
+    }
 }
 
-static bool apply_one(AppState *app, int fan, char *err, size_t err_len)
+static bool apply_one(AppState *app, int device_index, int fan, char *err, size_t err_len)
 {
-    CorsairFanMode mode = selected_mode(app, fan);
-    int duty = slider_duty(app, fan);
+    if (device_index < 0 || device_index >= app->device_count) {
+        snprintf(err, err_len, "Invalid controller index.");
+        return false;
+    }
 
-    if (fan_uses_nvidia_curve(app, fan)) {
+    ControllerRuntime *controller = &app->controllers[device_index];
+    if (!controller->opened) {
+        snprintf(err, err_len, "Controller is not initialized.");
+        return false;
+    }
+
+    CorsairFanMode mode = configured_mode(controller, fan);
+    int duty = controller->fan[fan].duty_percent;
+
+    if (fan_uses_nvidia_curve(controller, fan)) {
         if (!app->gpu_ok) {
             snprintf(err, err_len, "NVIDIA temperature is not available.");
             return false;
         }
-        if (app->device.status.fan_mode[fan] != CORSAIR_FAN_PWM &&
-            app->device.status.fan_mode[fan] != CORSAIR_FAN_DC) {
+        if (controller->device.status.fan_mode[fan] != CORSAIR_FAN_PWM &&
+            controller->device.status.fan_mode[fan] != CORSAIR_FAN_DC) {
             snprintf(err, err_len, "Fan %d is not connected as PWM or DC.", fan + 1);
             return false;
         }
         duty = nvidia_curve_duty(app);
-        app->last_nvidia_duty[fan] = -1;
-        return corsair_set_fan_duty(&app->device, fan, duty, err, err_len);
+        if (!corsair_set_fan_duty(&controller->device, fan, duty, err, err_len)) {
+            return false;
+        }
+        controller->last_nvidia_duty[fan] = duty;
+        return true;
     }
 
-    if ((int)mode != app->device.status.fan_mode[fan]) {
-        if (!corsair_set_fan_mode(&app->device, fan, mode, err, err_len)) {
+    controller->last_nvidia_duty[fan] = -1;
+    if ((int)mode != controller->device.status.fan_mode[fan]) {
+        if (!corsair_set_fan_mode(&controller->device, fan, mode, err, err_len)) {
             return false;
         }
     }
@@ -1025,21 +1238,24 @@ static bool apply_one(AppState *app, int fan, char *err, size_t err_len)
         return true;
     }
 
-    return corsair_set_fan_duty(&app->device, fan, duty, err, err_len);
+    return corsair_set_fan_duty(&controller->device, fan, duty, err, err_len);
 }
 
 static void apply_fan(AppState *app, int fan)
 {
     char err[256] = { 0 };
-    if (!app->opened) {
+    int device_index = selected_device_index(app);
+    if (device_index < 0 || !app->controllers[device_index].opened) {
         set_status(app, L"Select an initialized device first.");
         return;
     }
-    if (!apply_one(app, fan, err, sizeof(err))) {
+
+    capture_device_settings(app, device_index);
+    if (!apply_one(app, device_index, fan, err, sizeof(err))) {
         set_status_from_error(app, "Apply", err);
         return;
     }
-    app->saved_fan_setting[fan] = true;
+    app->controllers[device_index].fan[fan].apply = true;
     save_settings(app);
     refresh_status(app);
 }
@@ -1047,16 +1263,19 @@ static void apply_fan(AppState *app, int fan)
 static void apply_all(AppState *app)
 {
     char err[256] = { 0 };
-    if (!app->opened) {
+    int device_index = selected_device_index(app);
+    if (device_index < 0 || !app->controllers[device_index].opened) {
         set_status(app, L"Select an initialized device first.");
         return;
     }
+
+    capture_device_settings(app, device_index);
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-        if (!apply_one(app, i, err, sizeof(err))) {
+        if (!apply_one(app, device_index, i, err, sizeof(err))) {
             set_status_from_error(app, "Apply all", err);
             return;
         }
-        app->saved_fan_setting[i] = true;
+        app->controllers[device_index].fan[i].apply = true;
     }
     save_settings(app);
     refresh_status(app);
@@ -1194,20 +1413,46 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         } else if (id >= IDC_APPLY_BASE && id < IDC_APPLY_BASE + CORSAIR_FAN_COUNT) {
             apply_fan(app, id - IDC_APPLY_BASE);
         } else if (id == IDC_SAVE_SETTINGS) {
-            for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-                app->saved_fan_setting[i] = true;
+            int device_index = selected_device_index(app);
+            if (device_index >= 0) {
+                capture_device_settings(app, device_index);
+                for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+                    app->controllers[device_index].fan[i].apply = true;
+                }
             }
             save_settings(app);
-            if (app->opened) {
-                char err[256] = { 0 };
-                if (!apply_saved_fan_settings(app, err, sizeof(err))) {
-                    set_status_from_error(app, "Save/apply", err);
-                } else {
-                    refresh_status(app);
-                    set_status(app, L"Settings saved and applied.");
+
+            bool apply_ok = true;
+            char first_error[256] = { 0 };
+            for (int i = 0; i < app->device_count; ++i) {
+                if (!app->controllers[i].opened) {
+                    continue;
                 }
+                char err[256] = { 0 };
+                if (!apply_saved_fan_settings(app, i, err, sizeof(err))) {
+                    apply_ok = false;
+                    if (!first_error[0]) {
+                        snprintf(first_error, sizeof(first_error), "Controller %d: %s", i + 1, err);
+                    }
+                }
+            }
+
+            refresh_status(app);
+            for (int i = 0; i < app->device_count; ++i) {
+                if (!app->controllers[i].opened || app->controllers[i].last_error[0]) {
+                    apply_ok = false;
+                    if (!first_error[0]) {
+                        snprintf(first_error, sizeof(first_error), "Controller %d: %s", i + 1,
+                                 app->controllers[i].last_error[0]
+                                     ? app->controllers[i].last_error
+                                     : "could not be opened");
+                    }
+                }
+            }
+            if (!apply_ok) {
+                set_status_from_error(app, "Save/apply", first_error);
             } else {
-                set_status(app, L"Settings saved.");
+                set_status(app, L"Settings saved; all controllers updated.");
             }
         } else if (id == IDC_AUTOSTART && HIWORD(wparam) == BN_CLICKED) {
             bool enabled = SendMessageW(app->autostart_checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -1225,8 +1470,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             DestroyWindow(hwnd);
         } else if (id >= IDC_MODE_BASE && id < IDC_MODE_BASE + CORSAIR_FAN_COUNT &&
                    HIWORD(wparam) == CBN_SELCHANGE) {
-            app->saved_fan_setting[id - IDC_MODE_BASE] = true;
-            save_settings(app);
+            int device_index = selected_device_index(app);
+            if (device_index >= 0) {
+                capture_device_settings(app, device_index);
+                app->controllers[device_index].fan[id - IDC_MODE_BASE].apply = true;
+                save_settings(app);
+            }
         } else if ((id == IDC_GPU_TEMP_LOW || id == IDC_GPU_DUTY_LOW ||
                     id == IDC_GPU_TEMP_HIGH || id == IDC_GPU_DUTY_HIGH) &&
                    HIWORD(wparam) == EN_KILLFOCUS) {
@@ -1240,8 +1489,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             if ((HWND)lparam == app->fan_slider[i]) {
                 update_duty_label(app, i);
                 if (LOWORD(wparam) == TB_ENDTRACK || LOWORD(wparam) == SB_ENDSCROLL) {
-                    app->saved_fan_setting[i] = true;
-                    save_settings(app);
+                    int device_index = selected_device_index(app);
+                    if (device_index >= 0) {
+                        capture_device_settings(app, device_index);
+                        app->controllers[device_index].fan[i].apply = true;
+                        save_settings(app);
+                    }
                 }
                 break;
             }
@@ -1292,10 +1545,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             tray_update(app, NIM_DELETE);
         }
         app->tray_icon_wanted = false;
-        if (app->opened) {
-            corsair_close(&app->device);
-            app->opened = false;
-        }
+        close_all_controllers(app);
         PostQuitMessage(0);
         return 0;
     }
@@ -1314,9 +1564,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
 
     ZeroMemory(&g_app, sizeof(g_app));
     g_app.active_device_index = -1;
-    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
-        g_app.last_nvidia_duty[i] = -1;
-    }
     g_app.taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
     g_app.start_in_tray = strstr(cmd_line, "--tray") != NULL;
 
@@ -1347,9 +1594,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line, 
     }
 
     if (g_app.start_in_tray) {
-        if (g_app.device_count > 0 && !g_app.opened) {
-            open_selected_device(&g_app);
-        }
         hide_to_tray(&g_app);
     } else {
         ShowWindow(hwnd, show_cmd);
