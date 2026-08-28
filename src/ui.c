@@ -10,6 +10,14 @@
 #define WM_CTLCOLORLISTVIEW 0x013C  /* Win8+ comctl32; not in older winuser.h */
 #endif
 
+#ifndef WS_ENABLED
+#define WS_ENABLED 0x00010000  /* excluded by WIN32_LEAN_AND_MEAN */
+#endif
+
+#ifndef WS_DISABLED
+#define WS_DISABLED 0x08000000  /* excluded by WIN32_LEAN_AND_MEAN */
+#endif
+
 /* ------------------------------------------------------------------ theme */
 
 #define UI_LIST_MAX 4
@@ -436,7 +444,10 @@ static LRESULT CALLBACK button_proc(HWND hwnd, UINT msg, WPARAM wparam,
 {
     UiButtonData *d = (UiButtonData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     UiTheme *t = &g_theme;
-    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) != 0;
+    /* EnableWindow() sets WS_DISABLED; the WS_ENABLED/WS_TABSTOP bit
+     * (0x00010000) stays set either way on tabstop controls, so the
+     * disabled state must be derived from WS_DISABLED. */
+    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED) == 0;
 
     switch (msg) {
     case WM_NCCREATE: {
@@ -630,7 +641,10 @@ static LRESULT CALLBACK slider_proc(HWND hwnd, UINT msg, WPARAM wparam,
 {
     UiSliderData *d = (UiSliderData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     UiTheme *t = &g_theme;
-    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) != 0;
+    /* EnableWindow() sets WS_DISABLED; the WS_ENABLED/WS_TABSTOP bit
+     * (0x00010000) stays set either way on tabstop controls, so the
+     * disabled state must be derived from WS_DISABLED. */
+    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED) == 0;
 
     switch (msg) {
     case WM_NCCREATE: {
@@ -855,7 +869,10 @@ static LRESULT CALLBACK combo_proc(HWND hwnd, UINT msg, WPARAM wparam,
 {
     UiComboData *d = (UiComboData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     UiTheme *t = &g_theme;
-    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE) != 0;
+    /* EnableWindow() sets WS_DISABLED; the WS_ENABLED/WS_TABSTOP bit
+     * (0x00010000) stays set either way on tabstop controls, so the
+     * disabled state must be derived from WS_DISABLED. */
+    BOOL enabled = (GetWindowLongW(hwnd, GWL_STYLE) & WS_DISABLED) == 0;
 
     switch (msg) {
     case WM_NCCREATE: {
@@ -1028,8 +1045,6 @@ int ui_combo_selected(HWND hwnd)
  * (minimum 2 points). Every committed change posts UI_MSG_CURVE_CHANGED
  * to the parent window.
  */
-
-#define UI_CURVE_MAX_POINTS 12
 
 typedef struct UiCurveData {
     int count;
@@ -1739,12 +1754,28 @@ HWND ui_panel_list(HWND panel)
 
 void ui_panel_attach_list(HWND panel, HWND list)
 {
-    if (g_panel_list_count >= UI_LIST_MAX) {
+    /* Recycle a slot whose panel window no longer exists (the overview
+     * window is destroyed on close). Without this, every overview cycle
+     * would leak two slots and the table would fill up after two cycles,
+     * silently breaking the custom-drawn cell text of new list views. */
+    int slot = -1;
+    for (int i = 0; i < UI_LIST_MAX; ++i) {
+        if (!g_panel_lists[i].panel || !IsWindow(g_panel_lists[i].panel)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 && g_panel_list_count < UI_LIST_MAX) {
+        slot = g_panel_list_count;
+    }
+    if (slot < 0) {
         return;
     }
-    g_panel_lists[g_panel_list_count].panel = panel;
-    g_panel_lists[g_panel_list_count].list = list;
-    ++g_panel_list_count;
+    g_panel_lists[slot].panel = panel;
+    g_panel_lists[slot].list = list;
+    if (slot == g_panel_list_count) {
+        ++g_panel_list_count;
+    }
 }
 
 typedef struct UiListState {

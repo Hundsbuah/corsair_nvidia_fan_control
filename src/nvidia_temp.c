@@ -201,6 +201,31 @@ static void nvapi_unload(NvApi *api)
     memset(api, 0, sizeof(*api));
 }
 
+/* The driver DLL is loaded and NvAPI_Initialize is called once per process
+ * session: the official sample loads dynamically, but load/init/unload on
+ * every 5 s tick is pure overhead. The handle is kept until process exit
+ * (the OS reclaims it) or until an NVAPI error forces a fresh reload. */
+static NvApi g_nvapi;
+static bool g_nvapi_ready;
+
+static void nvapi_release(void)
+{
+    nvapi_unload(&g_nvapi);
+    g_nvapi_ready = false;
+}
+
+static bool nvapi_ensure(char *err, size_t err_len)
+{
+    if (g_nvapi_ready) {
+        return true;
+    }
+    if (!nvapi_load(&g_nvapi, err, err_len)) {
+        return false;
+    }
+    g_nvapi_ready = true;
+    return true;
+}
+
 static bool valid_temp(int temp)
 {
     return temp >= -20 && temp <= 125;
@@ -208,7 +233,7 @@ static bool valid_temp(int temp)
 
 bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
 {
-    NvApi api;
+    NvApi *api = &g_nvapi;
     NvPhysicalGpuHandle handles[NVAPI_MAX_PHYSICAL_GPUS] = { 0 };
     NvGpuThermalSettings thermal;
     NvU32 count = 0;
@@ -222,20 +247,20 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
 
     memset(status, 0, sizeof(*status));
 
-    if (!nvapi_load(&api, err, err_len)) {
+    if (!nvapi_ensure(err, err_len)) {
         return false;
     }
 
-    nvstatus = api.enum_physical_gpus(handles, &count);
+    nvstatus = api->enum_physical_gpus(handles, &count);
     if (nvstatus != NVAPI_OK || count == 0) {
-        nvapi_error(&api, nvstatus, err, err_len, "NvAPI_EnumPhysicalGPUs");
+        nvapi_error(api, nvstatus, err, err_len, "NvAPI_EnumPhysicalGPUs");
         goto out;
     }
 
     status->gpu_count = (int)count;
-    if (api.gpu_get_full_name) {
+    if (api->gpu_get_full_name) {
         NvAPI_ShortString name = { 0 };
-        if (api.gpu_get_full_name(handles[0], name) == NVAPI_OK && name[0] != '\0') {
+        if (api->gpu_get_full_name(handles[0], name) == NVAPI_OK && name[0] != '\0') {
             copy_str(status->name, sizeof(status->name), name);
         }
     }
@@ -246,9 +271,9 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     memset(&thermal, 0, sizeof(thermal));
     thermal.version = MAKE_NVAPI_VERSION(NvGpuThermalSettings, 2);
 
-    nvstatus = api.gpu_get_thermal_settings(handles[0], NVAPI_THERMAL_TARGET_ALL, &thermal);
+    nvstatus = api->gpu_get_thermal_settings(handles[0], NVAPI_THERMAL_TARGET_ALL, &thermal);
     if (nvstatus != NVAPI_OK) {
-        nvapi_error(&api, nvstatus, err, err_len, "NvAPI_GPU_GetThermalSettings");
+        nvapi_error(api, nvstatus, err, err_len, "NvAPI_GPU_GetThermalSettings");
         goto out;
     }
 
@@ -274,6 +299,11 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     set_error(err, err_len, "No valid NVIDIA GPU temperature sensor returned.");
 
 out:
-    nvapi_unload(&api);
+    if (!ok) {
+        /* Driver state can go stale (GPU reset, driver hiccup); release the
+         * session cache so the next read retries with a fresh load and
+         * initialize. */
+        nvapi_release();
+    }
     return ok;
 }

@@ -94,6 +94,8 @@ int ui_combo_selected(HWND hwnd);
  * double-click removes it (minimum 2 points). Every committed change posts
  * UI_MSG_CURVE_CHANGED to the parent window. */
 #define UI_MSG_CURVE_CHANGED (WM_APP + 10)
+#define UI_CURVE_MAX_POINTS 12  /* maximum points the editor holds (and the
+                                   settings parser accepts; see main.c) */
 void ui_curve_set_points(HWND hwnd, int count, const int *temp,
                          const int *duty);
 int ui_curve_get_points(HWND hwnd, int *count, int *temp, int *duty);

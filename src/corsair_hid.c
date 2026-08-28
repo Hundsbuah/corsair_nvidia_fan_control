@@ -24,6 +24,10 @@
 #define RESPONSE_LEN 16
 #define IO_TIMEOUT_MS 300
 #define MUTEX_TIMEOUT_MS 2000
+/* Read-only sensor refreshes fail fast when another application (iCUE) holds
+ * the device guard, so the UI thread is not blocked for seconds. Writes and
+ * initialization keep the full MUTEX_TIMEOUT_MS budget. */
+#define MUTEX_READ_TIMEOUT_MS 500
 
 static void set_error(char *err, size_t err_len, const char *fmt, ...)
 {
@@ -286,6 +290,7 @@ static bool response_success(unsigned char code, char *err, size_t err_len)
 static bool send_command(CorsairDevice *dev, unsigned char command,
                          const unsigned char *data, size_t data_len,
                          unsigned char response[RESPONSE_LEN],
+                         uint32_t mutex_timeout_ms,
                          char *err, size_t err_len)
 {
     unsigned char out[128];
@@ -305,7 +310,7 @@ static bool send_command(CorsairDevice *dev, unsigned char command,
         data_len = out_len - 2;
     }
 
-    wait_result = WaitForSingleObject(dev->io_mutex, MUTEX_TIMEOUT_MS);
+    wait_result = WaitForSingleObject(dev->io_mutex, mutex_timeout_ms);
     if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED) {
         set_error(err, err_len, "Could not acquire Corsair HID mutex.");
         return false;
@@ -430,27 +435,31 @@ bool corsair_initialize(CorsairDevice *dev, char *err, size_t err_len)
 {
     unsigned char res[RESPONSE_LEN];
 
-    if (!send_command(dev, CMD_GET_FIRMWARE, NULL, 0, res, err, err_len)) {
+    if (!send_command(dev, CMD_GET_FIRMWARE, NULL, 0, res, MUTEX_TIMEOUT_MS,
+                      err, err_len)) {
         return false;
     }
     dev->status.firmware[0] = res[1];
     dev->status.firmware[1] = res[2];
     dev->status.firmware[2] = res[3];
 
-    if (!send_command(dev, CMD_GET_BOOTLOADER, NULL, 0, res, err, err_len)) {
+    if (!send_command(dev, CMD_GET_BOOTLOADER, NULL, 0, res, MUTEX_TIMEOUT_MS,
+                      err, err_len)) {
         return false;
     }
     dev->status.bootloader[0] = res[1];
     dev->status.bootloader[1] = res[2];
 
-    if (!send_command(dev, CMD_GET_TEMP_CONFIG, NULL, 0, res, err, err_len)) {
+    if (!send_command(dev, CMD_GET_TEMP_CONFIG, NULL, 0, res, MUTEX_TIMEOUT_MS,
+                      err, err_len)) {
         return false;
     }
     for (int i = 0; i < CORSAIR_TEMP_COUNT; ++i) {
         dev->status.temp_connected[i] = res[i + 1] != 0;
     }
 
-    if (!send_command(dev, CMD_GET_FAN_MODES, NULL, 0, res, err, err_len)) {
+    if (!send_command(dev, CMD_GET_FAN_MODES, NULL, 0, res, MUTEX_TIMEOUT_MS,
+                      err, err_len)) {
         return false;
     }
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
@@ -468,7 +477,8 @@ bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
         dev->status.temp_c[i] = 0.0;
         if (dev->status.temp_connected[i]) {
             unsigned char data[1] = { (unsigned char)i };
-            if (!send_command(dev, CMD_GET_TEMP, data, sizeof(data), res, err, err_len)) {
+            if (!send_command(dev, CMD_GET_TEMP, data, sizeof(data), res,
+                              MUTEX_READ_TIMEOUT_MS, err, err_len)) {
                 return false;
             }
             dev->status.temp_c[i] = (double)(int16_t)u16_be(res, 1) / 100.0;
@@ -480,7 +490,8 @@ bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
         if (dev->status.fan_mode[i] == CORSAIR_FAN_DC ||
             dev->status.fan_mode[i] == CORSAIR_FAN_PWM) {
             unsigned char data[1] = { (unsigned char)i };
-            if (!send_command(dev, CMD_GET_FAN_RPM, data, sizeof(data), res, err, err_len)) {
+            if (!send_command(dev, CMD_GET_FAN_RPM, data, sizeof(data), res,
+                              MUTEX_READ_TIMEOUT_MS, err, err_len)) {
                 return false;
             }
             dev->status.fan_rpm[i] = u16_be(res, 1);
@@ -489,7 +500,8 @@ bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
 
     for (int i = 0; i < CORSAIR_VOLT_COUNT; ++i) {
         unsigned char data[1] = { (unsigned char)i };
-        if (!send_command(dev, CMD_GET_VOLTS, data, sizeof(data), res, err, err_len)) {
+        if (!send_command(dev, CMD_GET_VOLTS, data, sizeof(data), res,
+                          MUTEX_READ_TIMEOUT_MS, err, err_len)) {
             return false;
         }
         dev->status.volts[i] = (double)u16_be(res, 1) / 1000.0;
@@ -516,7 +528,8 @@ bool corsair_set_fan_duty(CorsairDevice *dev, int fan_index, int duty_percent, c
 
     data[0] = (unsigned char)fan_index;
     data[1] = (unsigned char)duty_percent;
-    return send_command(dev, CMD_SET_FAN_DUTY, data, sizeof(data), res, err, err_len);
+    return send_command(dev, CMD_SET_FAN_DUTY, data, sizeof(data), res,
+                        MUTEX_TIMEOUT_MS, err, err_len);
 }
 
 bool corsair_set_fan_mode(CorsairDevice *dev, int fan_index, CorsairFanMode mode, char *err, size_t err_len)
@@ -533,7 +546,8 @@ bool corsair_set_fan_mode(CorsairDevice *dev, int fan_index, CorsairFanMode mode
     data[1] = (unsigned char)fan_index;
     data[2] = (unsigned char)mode;
 
-    if (!send_command(dev, CMD_SET_FAN_MODE, data, sizeof(data), res, err, err_len)) {
+    if (!send_command(dev, CMD_SET_FAN_MODE, data, sizeof(data), res,
+                      MUTEX_TIMEOUT_MS, err, err_len)) {
         return false;
     }
 

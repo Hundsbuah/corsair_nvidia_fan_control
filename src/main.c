@@ -37,6 +37,14 @@
 #define REFRESH_TIMER 1
 #define TRAY_RETRY_TIMER 2
 #define POLL_INTERVAL_MS 5000
+/* Sensor reads (corsair_refresh) run every REFRESH_EVERY_TICKS-th refresh
+ * tick; the UI repaints every tick with the last known values. This halves
+ * the worst-case HID I/O per tick on the UI thread. A controller whose last
+ * refresh cycle failed is skipped entirely until every
+ * REFRESH_FAIL_RETRY_EVERY-th tick so a dead device does not trigger a
+ * close + reopen + full initialize on every 5 s tick. */
+#define REFRESH_EVERY_TICKS 2
+#define REFRESH_FAIL_RETRY_EVERY 4
 #define TRAY_RETRY_INTERVAL_MS 2000
 #define WM_TRAYICON (WM_APP + 1)
 #define TRAY_ICON_ID 1
@@ -64,6 +72,7 @@ typedef struct ControllerRuntime {
     int last_nvidia_duty[CORSAIR_FAN_COUNT];
     char last_error[256];
     bool opened;
+    bool refresh_failed;
 } ControllerRuntime;
 
 typedef struct AppState {
@@ -142,6 +151,7 @@ typedef struct AppState {
     bool gpu_ok;
     SYSTEMTIME last_poll_time;
     bool has_poll_time;
+    unsigned poll_counter;
     UINT taskbar_created_msg;
     bool start_in_tray;
     bool tray_added;
@@ -519,7 +529,14 @@ static void fake_refresh(AppState *app, int device_index)
     static const int base_rpm[CORSAIR_FAN_COUNT] = {
         2480, 2960, 0, 3120, 0, 1960
     };
+    static bool seeded;
     CorsairStatus *status = &app->controllers[device_index].device.status;
+
+    if (!seeded) {
+        srand((unsigned)GetTickCount());
+        seeded = true;
+    }
+
     for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
         if (status->fan_mode[i] == CORSAIR_FAN_DISCONNECTED || base_rpm[i] == 0) {
             status->fan_rpm[i] = 0;
@@ -535,6 +552,20 @@ static void fake_refresh(AppState *app, int device_index)
     }
     status->temp_c[0] += ((rand() % 5) - 2) * 0.1;
     status->temp_c[3] += ((rand() % 5) - 2) * 0.1;
+    /* Keep the random walk inside a plausible range so multi-hour fake
+     * sessions do not drift into unrealistic temperatures. */
+    if (status->temp_c[0] < 20.0) {
+        status->temp_c[0] = 20.0;
+    }
+    if (status->temp_c[0] > 70.0) {
+        status->temp_c[0] = 70.0;
+    }
+    if (status->temp_c[3] < 20.0) {
+        status->temp_c[3] = 20.0;
+    }
+    if (status->temp_c[3] > 70.0) {
+        status->temp_c[3] = 70.0;
+    }
 }
 
 static void fake_set_duty(AppState *app, int device_index, int fan, int duty)
@@ -635,7 +666,9 @@ static bool load_fan_settings_from_key(ControllerRuntime *controller, HKEY key)
     return any;
 }
 
-/* Parse "25:30,80:100" into point arrays; requires 2..16 valid points. */
+/* Parse "25:30,80:100" into point arrays; requires 2..UI_CURVE_MAX_POINTS
+ * valid points (same limit the interactive editor enforces, so points can
+ * never be silently dropped by ui_curve_set_points). */
 static bool parse_curve_points(const wchar_t *text, int *temps, int *duties,
                                int *count)
 {
@@ -651,7 +684,7 @@ static bool parse_curve_points(const wchar_t *text, int *temps, int *duties,
         wchar_t *end2 = NULL;
         long duty_value = wcstol(end1 + 1, &end2, 10);
         if (end2 == end1 + 1 || temp_value < 0 || temp_value > 100 ||
-            duty_value < 0 || duty_value > 100 || n >= 16) {
+            duty_value < 0 || duty_value > 100 || n >= UI_CURVE_MAX_POINTS) {
             return false;
         }
         temps[n] = (int)temp_value;
@@ -905,6 +938,13 @@ static void show_tray_menu(AppState *app)
 
     POINT pt;
     GetCursorPos(&pt);
+    /* In tray mode app->hwnd is SW_HIDE and SetForegroundWindow may be
+     * denied; activating the current foreground window first grants the
+     * foreground right so the popup menu closes on a click-away. */
+    HWND prev_foreground = GetForegroundWindow();
+    if (prev_foreground) {
+        SetForegroundWindow(prev_foreground);
+    }
     SetForegroundWindow(app->hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, app->hwnd, NULL);
     DestroyMenu(menu);
@@ -1253,6 +1293,10 @@ static bool open_controller(AppState *app, int device_index, char *err, size_t e
 
     controller->last_error[0] = '\0';
 
+    /* Populate device info before the fake check so is_fake_device() can see
+     * the scanned path; corsair_open overwrites dev->info for real devices. */
+    controller->device.info = app->devices[device_index];
+
     if (is_fake_device(&controller->device)) {
         fake_fill_base(&controller->device.status);
         controller->opened = true;
@@ -1423,6 +1467,7 @@ static void open_selected_device(AppState *app)
 static void refresh_status(AppState *app)
 {
     refresh_gpu_status(app);
+    ++app->poll_counter;
 
     char first_error[256] = { 0 };
     int first_error_index = -1;
@@ -1432,8 +1477,22 @@ static void refresh_status(AppState *app)
         bool controller_ok = true;
         char err[256] = { 0 };
 
+        if (!is_fake_device(&controller->device)) {
+            /* The fake device (CFC_FAKE test path) performs no HID I/O and
+             * keeps the full 5 s cadence; only real controllers are
+             * rate-limited. */
+            if (controller->refresh_failed) {
+                if (app->poll_counter % REFRESH_FAIL_RETRY_EVERY != 0) {
+                    continue;
+                }
+            } else if (app->poll_counter % REFRESH_EVERY_TICKS != 0) {
+                continue;
+            }
+        }
+
         if (!controller->opened) {
             if (!open_controller(app, i, err, sizeof(err))) {
+                controller->refresh_failed = true;
                 if (first_error_index < 0) {
                     first_error_index = i;
                     snprintf(first_error, sizeof(first_error), "%s", err);
@@ -1441,6 +1500,7 @@ static void refresh_status(AppState *app)
                 continue;
             }
             newly_opened = true;
+            controller->refresh_failed = false;
             if (controller->last_error[0]) {
                 controller_ok = false;
                 if (first_error_index < 0) {
@@ -1453,8 +1513,10 @@ static void refresh_status(AppState *app)
 
         if (is_fake_device(&controller->device)) {
             fake_refresh(app, i);
+            controller->refresh_failed = false;
         } else if (!newly_opened &&
                    !corsair_refresh(&controller->device, err, sizeof(err))) {
+            controller->refresh_failed = true;
             snprintf(controller->last_error, sizeof(controller->last_error), "%s", err);
             if (first_error_index < 0) {
                 first_error_index = i;
@@ -2088,6 +2150,7 @@ static LRESULT CALLBACK overview_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam,
     case WM_CTLCOLORDLG:
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
         return (LRESULT)ui_handle_ctrl_color(hwnd, (HDC)wparam, (HWND)lparam);
 
     case WM_CLOSE:
@@ -2701,6 +2764,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     case WM_CTLCOLORDLG:
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
         return (LRESULT)ui_handle_ctrl_color(hwnd, (HDC)wparam, (HWND)lparam);
 
     case WM_TRAYICON:
@@ -2766,7 +2830,24 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line,
     ZeroMemory(&g_app, sizeof(g_app));
     g_app.active_device_index = -1;
     g_app.taskbar_created_msg = RegisterWindowMessageW(L"TaskbarCreated");
-    g_app.start_in_tray = strstr(cmd_line, "--tray") != NULL;
+    /* Exact token match on the wide command line; a substring match on the
+     * ANSI string would also trigger tray mode for path arguments that
+     * merely contain "--tray". */
+    (void)cmd_line;
+    g_app.start_in_tray = false;
+    {
+        int argc = 0;
+        wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv) {
+            for (int i = 0; i < argc; ++i) {
+                if (lstrcmpW(argv[i], L"--tray") == 0) {
+                    g_app.start_in_tray = true;
+                    break;
+                }
+            }
+            LocalFree(argv);
+        }
+    }
 
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_BAR_CLASSES | ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
