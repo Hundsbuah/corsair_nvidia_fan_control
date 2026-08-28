@@ -160,7 +160,15 @@ int corsair_find_devices(CorsairDeviceInfo *devices, int max_devices, char *err,
             dst->product_id = attrs.ProductID;
             copy_wstr(dst->model, sizeof(dst->model) / sizeof(dst->model[0]), model_for_pid(attrs.ProductID));
 
-            if (!HidD_GetProductString(handle, dst->product, sizeof(dst->product)) || dst->product[0] == L'\0') {
+            /* USB serial number: stable + unique identifier for the physical
+             * device (used to key per-device settings). Empty if absent. */
+            dst->serial[0] = L'\0';
+            (void)HidD_GetSerialNumberString(handle, dst->serial,
+                                             (UINT)(sizeof(dst->serial) / sizeof(dst->serial[0])));
+
+            if (!HidD_GetProductString(handle, dst->product,
+                                       (UINT)(sizeof(dst->product) / sizeof(dst->product[0]))) ||
+                dst->product[0] == L'\0') {
                 copy_wstr(dst->product, sizeof(dst->product) / sizeof(dst->product[0]), dst->model);
             }
         }
@@ -472,6 +480,25 @@ bool corsair_initialize(CorsairDevice *dev, char *err, size_t err_len)
 bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
 {
     unsigned char res[RESPONSE_LEN];
+
+    /* Re-read probe connectivity and fan modes so hot-plugged fans/probes are
+     * detected without a full re-scan. Previously these were only read during
+     * initialization, leaving stale state (e.g. a newly plugged fan still
+     * "disconnected") until the next Scan. */
+    if (!send_command(dev, CMD_GET_TEMP_CONFIG, NULL, 0, res,
+                      MUTEX_READ_TIMEOUT_MS, err, err_len)) {
+        return false;
+    }
+    for (int i = 0; i < CORSAIR_TEMP_COUNT; ++i) {
+        dev->status.temp_connected[i] = res[i + 1] != 0;
+    }
+    if (!send_command(dev, CMD_GET_FAN_MODES, NULL, 0, res,
+                      MUTEX_READ_TIMEOUT_MS, err, err_len)) {
+        return false;
+    }
+    for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
+        dev->status.fan_mode[i] = res[i + 1];
+    }
 
     for (int i = 0; i < CORSAIR_TEMP_COUNT; ++i) {
         dev->status.temp_c[i] = 0.0;

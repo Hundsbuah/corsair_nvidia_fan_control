@@ -239,6 +239,11 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     NvU32 count = 0;
     NvAPI_Status nvstatus;
     bool ok = false;
+    /* true = transient driver error -> release the session so the next read
+     * retries with a fresh load/initialize; false = persistent condition
+     * (no GPU / no sensor) -> keep the session to avoid load/unload churn on
+     * every tick. */
+    bool reload = false;
 
     if (!status) {
         set_error(err, err_len, "Invalid NVIDIA status buffer.");
@@ -252,8 +257,13 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     }
 
     nvstatus = api->enum_physical_gpus(handles, &count);
-    if (nvstatus != NVAPI_OK || count == 0) {
+    if (nvstatus != NVAPI_OK) {
         nvapi_error(api, nvstatus, err, err_len, "NvAPI_EnumPhysicalGPUs");
+        reload = true;
+        goto out;
+    }
+    if (count == 0) {
+        set_error(err, err_len, "No NVIDIA GPU detected.");
         goto out;
     }
 
@@ -274,6 +284,7 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     nvstatus = api->gpu_get_thermal_settings(handles[0], NVAPI_THERMAL_TARGET_ALL, &thermal);
     if (nvstatus != NVAPI_OK) {
         nvapi_error(api, nvstatus, err, err_len, "NvAPI_GPU_GetThermalSettings");
+        reload = true;
         goto out;
     }
 
@@ -299,10 +310,11 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     set_error(err, err_len, "No valid NVIDIA GPU temperature sensor returned.");
 
 out:
-    if (!ok) {
-        /* Driver state can go stale (GPU reset, driver hiccup); release the
+    if (!ok && reload) {
+        /* Transient driver error (GPU reset, driver hiccup): release the
          * session cache so the next read retries with a fresh load and
-         * initialize. */
+         * initialize. Persistent conditions (no GPU / no sensor) keep the
+         * session to avoid load/unload churn on every tick. */
         nvapi_release();
     }
     return ok;

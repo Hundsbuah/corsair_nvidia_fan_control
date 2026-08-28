@@ -503,3 +503,48 @@ erst die „Notwendige Verifikation“ durchführen, dann entscheiden.
 | `nvapi_lite_common.h` (GitHub `NVIDIA/nvapi`) | `NvAPI_EnumPhysicalGPUs`-Dokumentation |
 | Windows SDK 10.0.22621.0 `um/winuser.h` | `WM_CTLCOLOR*`-Werte (0x132–0x138); `WM_CTLCOLORLISTVIEW` (0x013C) ist in SDK-Headern nicht definiert → `#define` mit `#ifndef`-Guard in ui.c ist korrekt, NICHT „fixen“ |
 | UCRT `corecrt_wstdio.h` (SDK 10.0.26100) | `swprintf` ist ISO-C99-konform (Count-Argument) → `swprintf(label, 8, L"%d", …)`-Aufrufe in ui.c sind korrekt, NICHT „fixen“ |
+
+---
+
+## Zweite unabhängige Review-Runde (2026-08-28) — Fixes implementiert
+
+Unabhängige, evidenzbasierte Re-Analyse des aktuellen Stands (Commit `67c5ec5`).
+Die erste Runde (M-001…U-006) wurde verifiziert als behoben. Diese Runde identifizierte
+neue/übriggebliebene Defekte und fixte sie. **Kein Compiler verfügbar → statische
+Verifizierung** (Signatur-/Contract-Prüfung), kein Live-Lauf.
+
+### Behobene Findings (Code geändert)
+
+| ID (Runde 2) | Severity | Vor-Runden-Bezug | Fix | Dateien |
+|---|---|---|---|---|
+| MED-001 | MEDIUM | neu | Pro-Gerät-Settings-Key aus instabilen Device-Pfad-Hash (Port-Abhängigkeit → Settings-Loss) auf **stabile Identität** umgestellt: USB-Serialnummer (`HidD_GetSerialNumberString`) als primärer Key, Fallback auf stabilen Hardware-Präfix des Pfads (vor erstem `#`). Eine einmalige Settings-Reset bei der ersten Lauf nach dem Fix ist akzeptabel (die alten Keys waren durch den Bug bereits unzuverlässig). | `corsair_hid.h` (+`serial[64]`), `corsair_hid.c` (Serial-Fill), `main.c` (`device_settings_key`) |
+| LOW-001 | LOW | M-002 (analog) | `g_registry`-Leak (UI-Control-Registry füllt sich mit toten Overview-Handles): neue `ui_reg_prune()` recycelt `!IsWindow`-Slots, wird in `ui_reg_new` aufgerufen. | `ui.c` |
+| LOW-002 | LOW | **U-002** (nun behoben) | `HidD_GetProductString` erhielt Byte-Zahl statt Zeichen-Zahl → auf `(sizeof/sizeof(wchar_t))` korrigiert. | `corsair_hid.c` |
+| LOW-003 | LOW | **I-001** (nun behoben) | NVAPI-DLL-Load/Unload-Churn bei wiederholt fehlendem GPU-Temp: nur noch **transiente** Fehler (Enum-/Thermal-Fehlerstatus) lösen `nvapi_release()` aus; persistente Zustände (`count==0`, kein Sensor) halten die Session. | `nvidia_temp.c` |
+| LOW-004 | LOW | neu | `fan_mode`/`temp_connected` nur bei Initialisierung gelesen (stale nach Hot-Plug → NVIDIA-Kurve/Anzeige falsch bis Scan): `corsair_refresh` liest `CMD_GET_TEMP_CONFIG`+`CMD_GET_FAN_MODES` jetzt zu Beginn (selbes, bereits verifiziertes Aufrufmuster wie `corsair_initialize`). | `corsair_hid.c` |
+| INF-001 | INFO | neu | Legacy-Fallback `GpuDutyLow`-Default `25` mit Standardkurve `25 °C→30 %` auf `30` aligniert. | `main.c` |
+
+### Bewusst NICHT behoben (mit Begründung)
+
+- **MED-002 / M-003 (UI-Thread-Blockade):** Volle Lösung erfordert eine **Worker-Thread-**
+  **Architekturänderung** (I/O aus dem UI-Thread heraus, asynchroner Status-Transfer,
+  Synchronisierung des geteilten `CorsairStatus`). Konzeptionell korrekt, aber
+  concurrency-riskant (Data Race/Lifetime) und hier ohne Hardware/Lauf **nicht verifizierbar**.
+  Die bestehende M-003-Mitigation (Rate-Limiting, Backoff, kurze Read-Timeouts) deckt den
+  Normalfall ab. → **Sichere, getrennte Task** mit Hardware-Test empfohlen, NICHT blind refaktoren.
+- **INF-002 / I-003 (Overview = owned Window):** Produktentscheidung, keine Fehlfunktion.
+- **UNVERIFIED (U-001, U-003, U-004, U-005, U-006 + neue UNV):** gemäß Review-Regel **nicht
+  blind fixen** — erst verifizieren (U-002 war die einzige, die sich als sicher herausstellte
+  und wurde fixt). Details: U-001 (Overlapped-Event nach CancelIoEx), U-003 (0xFFFF→-0.01 °C),
+  U-004 (Global\ vs. Session-Mutex), U-005 (stale GDI-Handle), U-006 (GpuCurvePts 13–16 Punkte).
+
+### Verifikation (statisch)
+
+- `HidD_GetSerialNumberString` ist in `<hidsdi.h>` deklariert (bereits eingebunden).
+- `send_command(NULL, 0)` ist sicher (`if (data && data_len > 0)`); `CMD_GET_TEMP_CONFIG`/
+  `CMD_GET_FAN_MODES`-Aufrufmuster identisch zu `corsair_initialize` (corsair_hid.c:461/469).
+- `UiRegistryEntry`-Felder `hwnd`/`has_font`/`has_ctrl` existieren; `IsWindow` via `windows.h`.
+- `CorsairDeviceInfo` hat keine Positional-Initialisierer (nur `ZeroMemory`+Feldzuweisung) →
+  neues `serial`-Feld bricht nichts (`cli_probe.c`/`main.c` nutzen uninitialisierte Arrays).
+- `swprintf` mit C99-Count-Semantik (UCRT) ist konsistent mit Bestand; Puffer `ident[160]`
+  overflow-sicher (Serial ≤63 Chars).

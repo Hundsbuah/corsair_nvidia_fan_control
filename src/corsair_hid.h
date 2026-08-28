@@ -20,6 +20,7 @@ typedef struct CorsairDeviceInfo {
     wchar_t path[512];
     wchar_t product[128];
     wchar_t model[64];
+    wchar_t serial[64];   /* USB serial number (stable + unique); empty if absent */
     uint16_t vendor_id;
     uint16_t product_id;
 } CorsairDeviceInfo;

@@ -406,11 +406,34 @@ static void settings_write_string(HKEY key, const wchar_t *name, const wchar_t *
                    (const BYTE *)value, (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
 }
 
+/* Derive a stable key that identifies the PHYSICAL controller, not the USB
+ * port. Prefers the USB serial number (stable + unique across reboots and
+ * port moves). Falls back to the stable hardware prefix of the device path
+ * (everything before the first '#', which excludes the port-dependent
+ * instance ID). The previous full-path hash changed when the controller was
+ * moved to a different port, silently losing per-device settings. */
 static void device_settings_key(const CorsairDeviceInfo *info, wchar_t *key,
                                 size_t key_count)
 {
     uint64_t hash = 1469598103934665603ULL;
-    const wchar_t *text = info && info->path[0] ? info->path : L"unknown";
+    wchar_t ident[160];
+    const wchar_t *text;
+
+    if (info && info->serial[0]) {
+        swprintf(ident, 160, L"usb:%04X:%04X:%s",
+                 (unsigned)info->vendor_id, (unsigned)info->product_id,
+                 info->serial);
+        text = ident;
+    } else {
+        const wchar_t *path = info && info->path[0] ? info->path : L"unknown";
+        size_t i = 0;
+        while (path[i] != L'\0' && path[i] != L'#' && i + 1 < 160) {
+            ident[i] = path[i];
+            ++i;
+        }
+        ident[i] = L'\0';
+        text = ident;
+    }
 
     for (size_t i = 0; text[i] != L'\0'; ++i) {
         hash ^= (uint64_t)(uint16_t)text[i];
@@ -481,7 +504,10 @@ static int g_fake_duty[CORSAIR_FAN_COUNT];
 
 static bool fake_device_enabled(void)
 {
-    return getenv(FAKE_DEVICE_ENV) != NULL;
+    /* Win32 query (no allocation, avoids the deprecated CRT getenv): returns
+     * the character count the value would occupy, or 0 if the variable is
+     * unset. */
+    return GetEnvironmentVariableA(FAKE_DEVICE_ENV, NULL, 0) > 0;
 }
 
 static bool is_fake_device(const CorsairDevice *dev)
@@ -746,7 +772,7 @@ static void load_global_settings(AppState *app)
                 settings_try_read_dword(key, L"GpuTempHigh", &temp_high)) {
                 int legacy_t[2] = { (int)temp_low, (int)temp_high };
                 int legacy_d[2] = {
-                    (int)settings_read_dword(key, L"GpuDutyLow", 25),
+                    (int)settings_read_dword(key, L"GpuDutyLow", 30),
                     (int)settings_read_dword(key, L"GpuDutyHigh", 100)
                 };
                 ui_curve_set_points(app->curve_graph, 2, legacy_t, legacy_d);
@@ -1057,7 +1083,7 @@ static void refresh_gpu_status(AppState *app)
     if (!app->gpu_ok && fake_device_enabled()) {
         app->gpu.available = true;
         app->gpu.gpu_count = 1;
-        strcpy(app->gpu.name, "GeForce RTX 4090 (Test)");
+        strcpy_s(app->gpu.name, sizeof(app->gpu.name), "GeForce RTX 4090 (Test)");
         double phase = (double)GetTickCount() / 25000.0;
         app->gpu.temperature_c = (int)(56.0 + 10.0 * sin(phase));
         app->gpu_ok = true;

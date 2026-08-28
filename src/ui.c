@@ -271,8 +271,29 @@ static UiRegistryEntry *ui_reg_find(HWND hwnd)
     return NULL;
 }
 
+/* Reclaim registry slots whose control window no longer exists. Overview
+ * controls are recreated on each open/close cycle; without pruning the 256
+ * slots fill up with dead handles after ~15-25 cycles and new controls stop
+ * receiving theme fonts / CTLCOLOR theming. */
+static void ui_reg_prune(void)
+{
+    for (int i = 0; i < UI_REGISTRY_MAX; ++i) {
+        if (g_registry[i].hwnd && !IsWindow(g_registry[i].hwnd)) {
+            g_registry[i].hwnd = NULL;
+            g_registry[i].has_font = false;
+            g_registry[i].has_ctrl = false;
+        }
+    }
+}
+
 static UiRegistryEntry *ui_reg_new(void)
 {
+    for (int i = 0; i < UI_REGISTRY_MAX; ++i) {
+        if (g_registry[i].hwnd == NULL) {
+            return &g_registry[i];
+        }
+    }
+    ui_reg_prune();
     for (int i = 0; i < UI_REGISTRY_MAX; ++i) {
         if (g_registry[i].hwnd == NULL) {
             return &g_registry[i];
