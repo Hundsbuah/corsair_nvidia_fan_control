@@ -1515,14 +1515,24 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
 
             wchar_t label[24];
             swprintf(label, 24, L"%d°C · %d%%", temp, duty);
-            int tw = ui_px(58);
+            HGDIOBJ old_font = SelectObject(mem, t->font[UI_FONT_MONO]);
+            SIZE tsz;
+            GetTextExtentPoint32W(mem, label, (int)wcslen(label), &tsz);
+            SelectObject(mem, old_font);
+            int tw = tsz.cx + ui_px(8);
             int lx = x + ui_px(8);
             if (lx + tw > plot_r) {
                 lx = x - ui_px(8) - tw;
+                if (lx < pad_l) {
+                    lx = pad_l;
+                }
             }
             int ly = d->mouse_y - ui_px(20);
             if (ly < pad_t + 2) {
                 ly = d->mouse_y + ui_px(8);
+            }
+            if (ly + ui_px(16) > plot_b) {
+                ly = plot_b - ui_px(16);
             }
             RECT lr;
             lr.left = lx;
