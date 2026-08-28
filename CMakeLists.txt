@@ -4,6 +4,7 @@ project(corsair_nvidia_fan_control C RC)
 
 add_executable(corsair_nvidia_fan_control WIN32
     src/main.c
+    src/ui.c
     src/corsair_hid.c
     src/nvidia_temp.c
     src/resources.rc
@@ -22,13 +23,13 @@ target_compile_definitions(corsair_nvidia_fan_control PRIVATE
     UNICODE
     _UNICODE
     WIN32_LEAN_AND_MEAN
-    _WIN32_WINNT=0x0600
+    _WIN32_WINNT=0x0A00
 )
 target_compile_definitions(corsair_nvidia_probe PRIVATE
     UNICODE
     _UNICODE
     WIN32_LEAN_AND_MEAN
-    _WIN32_WINNT=0x0600
+    _WIN32_WINNT=0x0A00
 )
 
 set(CORSAIR_TARGETS corsair_nvidia_fan_control corsair_nvidia_probe)
