@@ -1,0 +1,218 @@
+# Universal .graphifyignore
+# Goal: keep first-party source, tests, architecture/spec docs, schemas and useful configs;
+# exclude dependencies, generated output, caches, agent/IDE metadata and low-value noise.
+# Syntax: same as .gitignore.
+
+# -----------------------------------------------------------------------------
+# Version control / IDE / AI-agent metadata
+# -----------------------------------------------------------------------------
+.git/
+.hg/
+.svn/
+# Remove the next line if CI/CD workflows belong in your architecture graph.
+.github/
+.vscode/
+.idea/
+.vs/
+.fleet/
+.zed/
+.agents/
+.qwen/
+.pi/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.windsurf/
+.continue/
+.tools/
+.tooling/
+.tooling-state/
+.worktrees/
+.worktree/
+.scratch/
+
+# -----------------------------------------------------------------------------
+# Graphify's own output / transient artifacts
+# -----------------------------------------------------------------------------
+graphify-out/
+.graphify_semantic_parts/
+.graphify_ast.json
+.graphify_cached.json
+.graphify_chunks.json
+.graphify_detect.json
+.graphify_extract.json
+.graphify_analysis.json
+.graphify_labels.json
+.graphify_uncached.txt
+
+# -----------------------------------------------------------------------------
+# Third-party dependencies / virtual environments
+# -----------------------------------------------------------------------------
+node_modules/
+vendor/
+.venv/
+venv/
+.tox/
+.nox/
+__pypackages__/
+site-packages/
+.gradle/
+.pnpm-store/
+.npm/
+.yarn/cache/
+.yarn/unplugged/
+.bundle/
+vendor/bundle/
+Pods/
+Carthage/Build/
+
+# -----------------------------------------------------------------------------
+# Build / generated framework output / caches
+# -----------------------------------------------------------------------------
+dist/
+build/
+build-review/
+build-review2/
+build_clean/
+build_review/
+review_artifacts/
+out/
+target/
+obj/
+.next/
+.nuxt/
+.svelte-kit/
+.angular/cache/
+.vite/
+.turbo/
+.parcel-cache/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+__pycache__/
+*.pyc
+*.pyo
+*.class
+*.map
+*.min.js
+*.min.css
+
+# -----------------------------------------------------------------------------
+# Test / coverage reports and generated snapshots (keep the tests themselves)
+# -----------------------------------------------------------------------------
+coverage/
+htmlcov/
+.nyc_output/
+test-results/
+playwright-report/
+allure-results/
+allure-report/
+*.coverage
+coverage.xml
+lcov.info
+*.snap
+
+# -----------------------------------------------------------------------------
+# Dependency lockfiles: useful to package managers, usually low-value graph noise
+# -----------------------------------------------------------------------------
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+Cargo.lock
+poetry.lock
+uv.lock
+Pipfile.lock
+composer.lock
+Gemfile.lock
+Podfile.lock
+Package.resolved
+gradle.lockfile
+packages.lock.json
+go.sum
+
+# -----------------------------------------------------------------------------
+# Temporary / logs / editor / OS noise
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# Secrets / local credentials (Graphify also has safety screens; keep defense-in-depth)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa
+id_rsa.*
+
+# -----------------------------------------------------------------------------
+# Generated documentation/site output only — keep source docs/
+# -----------------------------------------------------------------------------
+_site/
+docs/_build/
+docs/build/
+.docusaurus/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+docs/.vuepress/.cache/
+docs/.vuepress/dist/
+storybook-static/
+
+# -----------------------------------------------------------------------------
+# Low-value administrative/release prose
+# Keep README.md, ARCHITECTURE.md, ADRs, specs and normal docs/ by default.
+# -----------------------------------------------------------------------------
+CHANGELOG.md
+CHANGELOG.*
+HISTORY.md
+HISTORY.*
+RELEASE_NOTES.md
+RELEASE_NOTES.*
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+
+# -----------------------------------------------------------------------------
+# Project-local agent/bootstrap metadata retained from your previous file
+# -----------------------------------------------------------------------------
+skills-lock.json
+Invoke-QwenTickets*.ps1
+AGENTS.md
+FIRST_RUN.md
+PREREQUISITES.md
+TEMPLATE_TEST_REPORT.md
+TEMPLATE_VERSION.txt
+docs/agents/IMPLEMENTATION_PROTOCOL.md
+docs/agents/IMPLEMENT_ALL.md
+
+# Intentionally NOT ignored by this universal baseline:
+# README.md, ARCHITECTURE.md, docs/, specs/, ADRs, tests/, migrations/,
+# Dockerfile/docker-compose files, package manifests, schemas and first-party configs.
+# Also NOT ignored from your old file: Auftrag.md and SOURCES.md, because these may
+# contain requirements, rationale or source provenance that is valuable to the graph.
