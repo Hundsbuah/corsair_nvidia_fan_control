@@ -16,7 +16,8 @@ without iCUE. It uses the device's USB HID protocol directly and targets:
 - Applies fixed duty-cycle fan speeds per channel or to all connected channels.
 - Can force a fan channel mode to PWM, DC or Off when detection is wrong.
 - Reads the first NVIDIA GPU core temperature through NVAPI and can run a
-  simple two-point GPU-temperature fan curve across every detected controller.
+  multi-point GPU-temperature fan curve, edited directly on the curve graph,
+  across every detected controller.
 - Saves fan modes, fixed duty values, selected controller and GPU curve points
   and can reapply them automatically on startup.
 - Can register itself for login autostart and run minimized in the Windows
@@ -74,9 +75,12 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 4. Click `Overview` to see the cached live values from every controller in one
    resizable window. The tables update with the five-second background poll.
 5. Move a fan slider and click the row's `Apply`, or use `Apply all`.
-6. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is a
-   simple two-point interpolation from `Low C/%` to `High C/%`; defaults are
-   `40 C -> 25%` and `80 C -> 100%`.
+6. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is
+   edited directly on the `GPU CURVE` graph, where both temperature and fan
+   duty range from 0 to 100: right-click adds a point, dragging moves it,
+   and double-click (or right-click without dragging) removes a point;
+   at least two points are required. Defaults are `25 C -> 30%` and
+   `80 C -> 100%`.
 7. Click `Save` to persist all current fan modes, fixed percentages and curve
    points. If the controller is open, `Save` also applies them immediately.
 8. Enable `Autostart` to create a per-user login entry. The stored command is

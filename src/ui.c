@@ -1017,29 +1017,206 @@ int ui_combo_selected(HWND hwnd)
 }
 
 /* ----------------------------------------------------------- GPU curve */
+/*
+ * Interactive temperature/duty editor. Both axes are fixed to 0-100:
+ * x = GPU temperature (deg C), y = fan duty (%). The curve is a set of
+ * ordered points with piecewise-linear interpolation.
+ *
+ * Right-click on empty space  adds a point (drag it straight away);
+ * drag a point (left or right) moves it;
+ * right-click on a point (without dragging) or double-click removes it
+ * (minimum 2 points). Every committed change posts UI_MSG_CURVE_CHANGED
+ * to the parent window.
+ */
+
+#define UI_CURVE_MAX_POINTS 12
 
 typedef struct UiCurveData {
-    int t_low;
-    int d_low;
-    int t_high;
-    int d_high;
+    int count;
+    int temp[UI_CURVE_MAX_POINTS]; /* strictly ascending after sort */
+    int duty[UI_CURVE_MAX_POINTS];
     int t_now;
     int now_ok;
+    int drag_index;  /* -1 = no drag, otherwise dragged point */
+    int drag_is_add; /* drag started on empty space (pending add)  */
+    int drag_moved;
+    int mouse_x;
+    int mouse_y;
+    int mouse_in;
+    int hover_index; /* point under the cursor, -1 = none */
 } UiCurveData;
 
-static int ui_curve_value_at(int temp, const UiCurveData *c)
+static void ui_curve_notify(HWND hwnd)
 {
-    if (c->t_high <= c->t_low) {
-        return temp >= c->t_low ? c->d_high : c->d_low;
+    UiCurveData *d = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    HWND parent = GetParent(hwnd);
+    if (d && parent) {
+        PostMessageW(parent, UI_MSG_CURVE_CHANGED, (WPARAM)d->count,
+                     (LPARAM)hwnd);
     }
-    if (temp <= c->t_low) {
-        return c->d_low;
+}
+
+static void ui_curve_layout(const RECT *client, int *plot_l, int *plot_t,
+                            int *plot_w, int *plot_h)
+{
+    *plot_l = ui_px(30);
+    *plot_t = ui_px(8);
+    *plot_w = client->right - *plot_l - ui_px(8);
+    *plot_h = client->bottom - *plot_t - ui_px(18);
+}
+
+static int ui_curve_x_for_temp(int temp, int plot_l, int plot_w)
+{
+    return plot_l + (int)(temp / 100.0 * plot_w + 0.5);
+}
+
+static int ui_curve_y_for_duty(int duty, int plot_t, int plot_h)
+{
+    return plot_t + (int)((100.0 - duty) / 100.0 * plot_h + 0.5);
+}
+
+static int ui_curve_temp_at_x(int x, int plot_l, int plot_w)
+{
+    int v = (int)((x - plot_l) * 100.0 / plot_w + 0.5);
+    if (v < 0) {
+        v = 0;
     }
-    if (temp >= c->t_high) {
-        return c->d_high;
+    if (v > 100) {
+        v = 100;
     }
-    return c->d_low + ((temp - c->t_low) * (c->d_high - c->d_low)) /
-           (c->t_high - c->t_low);
+    return v;
+}
+
+static int ui_curve_duty_at_y(int y, int plot_t, int plot_h)
+{
+    int v = (int)((plot_t + plot_h - y) * 100.0 / plot_h + 0.5);
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 100) {
+        v = 100;
+    }
+    return v;
+}
+
+static POINT ui_curve_point_from_lparam(LPARAM lparam)
+{
+    POINT pt;
+    pt.x = (short)LOWORD(lparam);
+    pt.y = (short)HIWORD(lparam);
+    return pt;
+}
+
+/* Piecewise-linear duty for a temperature, clamped to the end points. */
+static int ui_curve_interpolate(int temp, const UiCurveData *d)
+{
+    if (d->count == 0) {
+        return 0;
+    }
+    if (temp <= d->temp[0]) {
+        return d->duty[0];
+    }
+    for (int i = 1; i < d->count; ++i) {
+        int t0 = d->temp[i - 1];
+        int t1 = d->temp[i];
+        if (temp <= t1) {
+            if (t1 <= t0) {
+                return d->duty[i];
+            }
+            int d0 = d->duty[i - 1];
+            int d1 = d->duty[i];
+            return d0 + ((temp - t0) * (d1 - d0)) / (t1 - t0);
+        }
+    }
+    return d->duty[d->count - 1];
+}
+
+static int ui_curve_point_at(const UiCurveData *d, const RECT *client, int x,
+                             int y)
+{
+    int plot_l, plot_t, plot_w, plot_h;
+    ui_curve_layout(client, &plot_l, &plot_t, &plot_w, &plot_h);
+    int r = ui_px(7);
+    for (int i = 0; i < d->count; ++i) {
+        int cx = ui_curve_x_for_temp(d->temp[i], plot_l, plot_w);
+        int cy = ui_curve_y_for_duty(d->duty[i], plot_t, plot_h);
+        int dx = x - cx;
+        int dy = y - cy;
+        if (dx * dx + dy * dy <= r * r) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Move a point, keeping it strictly between its temperature neighbours. */
+static void ui_curve_set_dragged(UiCurveData *d, int index, int temp, int duty)
+{
+    int t_min = 0;
+    int t_max = 100;
+    if (index > 0) {
+        t_min = d->temp[index - 1] + 1;
+    }
+    if (index < d->count - 1) {
+        t_max = d->temp[index + 1] - 1;
+    }
+    if (t_min > t_max) {
+        t_min = t_max;
+    }
+    if (temp < t_min) {
+        temp = t_min;
+    }
+    if (temp > t_max) {
+        temp = t_max;
+    }
+    if (duty < 0) {
+        duty = 0;
+    }
+    if (duty > 100) {
+        duty = 100;
+    }
+    d->temp[index] = temp;
+    d->duty[index] = duty;
+}
+
+/* Insert a point (or retarget an existing point with the same temperature).
+ * Returns the point index, or -1 when the curve is full. */
+static int ui_curve_add_point(UiCurveData *d, int temp, int duty)
+{
+    if (d->count >= UI_CURVE_MAX_POINTS) {
+        return -1;
+    }
+    int insert = d->count;
+    for (int i = 0; i < d->count; ++i) {
+        if (d->temp[i] == temp) {
+            d->duty[i] = duty;
+            return i;
+        }
+        if (d->temp[i] > temp) {
+            insert = i;
+            break;
+        }
+    }
+    for (int i = d->count; i > insert; --i) {
+        d->temp[i] = d->temp[i - 1];
+        d->duty[i] = d->duty[i - 1];
+    }
+    d->temp[insert] = temp;
+    d->duty[insert] = duty;
+    ++d->count;
+    return insert;
+}
+
+static void ui_curve_remove_point(UiCurveData *d, int index)
+{
+    if (index < 0 || index >= d->count || d->count <= 2) {
+        return;
+    }
+    for (int i = index; i < d->count - 1; ++i) {
+        d->temp[i] = d->temp[i + 1];
+        d->duty[i] = d->duty[i + 1];
+    }
+    --d->count;
 }
 
 static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
@@ -1049,79 +1226,189 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
     (void)lparam;
     UiCurveData *d = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     UiTheme *t = &g_theme;
+    RECT client;
 
     switch (msg) {
     case WM_NCCREATE: {
         UiCurveData *data =
             (UiCurveData *)HeapAlloc(GetProcessHeap(), 0, sizeof(UiCurveData));
         ZeroMemory(data, sizeof(UiCurveData));
-        data->t_low = 40;
-        data->d_low = 25;
-        data->t_high = 80;
-        data->d_high = 100;
+        /* Default curve: 25 deg C -> 30%, 80 deg C -> 100%. */
+        data->count = 2;
+        data->temp[0] = 25;
+        data->duty[0] = 30;
+        data->temp[1] = 80;
+        data->duty[1] = 100;
+        data->drag_index = -1;
+        data->hover_index = -1;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+    case WM_MOUSEMOVE: {
+        POINT pt = ui_curve_point_from_lparam(lparam);
+        GetClientRect(hwnd, &client);
+        int plot_l, plot_t, plot_w, plot_h;
+        ui_curve_layout(&client, &plot_l, &plot_t, &plot_w, &plot_h);
+        d->mouse_in = (pt.x >= plot_l && pt.x <= plot_l + plot_w &&
+                       pt.y >= plot_t && pt.y <= plot_t + plot_h);
+        d->mouse_x = pt.x;
+        d->mouse_y = pt.y;
+        TRACKMOUSEEVENT tme;
+        ZeroMemory(&tme, sizeof(tme));
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        TrackMouseEvent(&tme);
+
+        if (d->drag_index >= 0 || d->drag_is_add) {
+            int temp = ui_curve_temp_at_x(pt.x, plot_l, plot_w);
+            int duty = ui_curve_duty_at_y(pt.y, plot_t, plot_h);
+            if (d->drag_is_add) {
+                int added = ui_curve_add_point(d, temp, duty);
+                if (added >= 0) {
+                    d->drag_index = added;
+                    d->drag_is_add = 0;
+                    d->drag_moved = 1;
+                }
+            } else if (temp != d->temp[d->drag_index] ||
+                       duty != d->duty[d->drag_index]) {
+                ui_curve_set_dragged(d, d->drag_index, temp, duty);
+                d->drag_moved = 1;
+            }
+        }
+        d->hover_index = d->drag_index >= 0
+                             ? d->drag_index
+                             : ui_curve_point_at(d, &client, pt.x, pt.y);
+        SetCursor(LoadCursorW(NULL, d->mouse_in ? IDC_CROSS : IDC_ARROW));
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN: {
+        POINT pt = ui_curve_point_from_lparam(lparam);
+        GetClientRect(hwnd, &client);
+        int plot_l, plot_t, plot_w, plot_h;
+        ui_curve_layout(&client, &plot_l, &plot_t, &plot_w, &plot_h);
+        if (pt.x < plot_l || pt.x > plot_l + plot_w || pt.y < plot_t ||
+            pt.y > plot_t + plot_h) {
+            return 0;
+        }
+        d->mouse_in = 1;
+        int hit = ui_curve_point_at(d, &client, pt.x, pt.y);
+        if (msg == WM_RBUTTONDOWN && hit < 0) {
+            /* Right button on empty space: arm a new point. */
+            d->drag_index = -1;
+            d->drag_is_add = 1;
+            d->drag_moved = 0;
+        } else if (hit >= 0) {
+            d->drag_index = hit;
+            d->drag_is_add = 0;
+            d->drag_moved = 0;
+        } else {
+            return 0;
+        }
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP: {
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
+        if (d->drag_index < 0 && !d->drag_is_add) {
+            return 0;
+        }
+        POINT pt = ui_curve_point_from_lparam(lparam);
+        GetClientRect(hwnd, &client);
+        int plot_l, plot_t, plot_w, plot_h;
+        ui_curve_layout(&client, &plot_l, &plot_t, &plot_w, &plot_h);
+        bool changed = false;
+        if (d->drag_is_add) {
+            int temp = ui_curve_temp_at_x(pt.x, plot_l, plot_w);
+            int duty = ui_curve_duty_at_y(pt.y, plot_t, plot_h);
+            if (ui_curve_add_point(d, temp, duty) >= 0) {
+                changed = true;
+            }
+        } else if (msg == WM_RBUTTONUP && !d->drag_moved) {
+            ui_curve_remove_point(d, d->drag_index);
+            changed = true;
+        } else if (d->drag_moved) {
+            /* A point was dragged to a new position. */
+            changed = true;
+        }
+        d->drag_index = -1;
+        d->drag_is_add = 0;
+        d->drag_moved = 0;
+        if (changed) {
+            ui_curve_notify(hwnd);
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDBLCLK: {
+        POINT pt = ui_curve_point_from_lparam(lparam);
+        GetClientRect(hwnd, &client);
+        int hit = ui_curve_point_at(d, &client, pt.x, pt.y);
+        if (hit >= 0) {
+            ui_curve_remove_point(d, hit);
+            ui_curve_notify(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        d->mouse_in = 0;
+        d->hover_index = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        RECT client;
         HBITMAP bits;
         HDC mem;
         HDC hdc = ui_memdc_begin(hwnd, &ps, &client, &bits, &mem);
         FillRect(mem, &client, t->panel_brush);
 
-        int pad_l = ui_px(30);
-        int pad_r = ui_px(8);
-        int pad_t = ui_px(8);
-        int pad_b = ui_px(18);
-        int plot_w = client.right - pad_l - pad_r;
-        int plot_h = client.bottom - pad_t - pad_b;
+        int pad_l, pad_t, plot_w, plot_h;
+        ui_curve_layout(&client, &pad_l, &pad_t, &plot_w, &plot_h);
         if (plot_w < 40 || plot_h < 40) {
             ui_memdc_end(hwnd, &ps, hdc, &client, &bits, &mem);
             return 0;
         }
+        int plot_r = pad_l + plot_w;
+        int plot_b = pad_t + plot_h;
 
-        int x_max = 90;
-        if (d->t_high + 5 > x_max) {
-            x_max = d->t_high + 5;
-        }
-        if (d->t_low + 5 > x_max) {
-            x_max = d->t_low + 5;
-        }
-        if (d->now_ok && d->t_now + 5 > x_max) {
-            x_max = d->t_now + 5;
-        }
-
-        /* Grid lines + labels. */
-        int step = x_max > 90 ? 20 : 10;
-        for (int temp = step; temp < x_max; temp += step) {
-            int x = pad_l + (int)((double)temp / (double)x_max * plot_w + 0.5);
+        /* Grid: vertical lines every 10, labels every 20. */
+        for (int temp = 10; temp < 100; temp += 10) {
+            int x = ui_curve_x_for_temp(temp, pad_l, plot_w);
             HPEN grid_pen = CreatePen(PS_SOLID, 1, t->panel_alt);
             HGDIOBJ old_pen = SelectObject(mem, grid_pen);
             MoveToEx(mem, x, pad_t, NULL);
-            LineTo(mem, x, pad_t + plot_h);
+            LineTo(mem, x, plot_b);
             SelectObject(mem, old_pen);
             DeleteObject(grid_pen);
-            if (temp % 20 == 0 || x_max <= 90) {
-                wchar_t label[8];
-                swprintf(label, 8, L"%d", temp);
-                RECT lr;
-                lr.left = x - ui_px(14);
-                lr.top = client.bottom - pad_b + 2;
-                lr.right = x + ui_px(14);
-                lr.bottom = client.bottom;
-                ui_draw_text_hdc(mem, t->font[UI_FONT_CAPTION], label, t->dim,
-                                 &lr, DT_CENTER | DT_TOP | DT_SINGLELINE);
-            }
+        }
+        for (int temp = 0; temp <= 100; temp += 20) {
+            wchar_t label[8];
+            swprintf(label, 8, L"%d", temp);
+            int x = ui_curve_x_for_temp(temp, pad_l, plot_w);
+            RECT lr;
+            lr.left = x - ui_px(14);
+            lr.top = plot_b + 2;
+            lr.right = x + ui_px(14);
+            lr.bottom = client.bottom;
+            ui_draw_text_hdc(mem, t->font[UI_FONT_CAPTION], label, t->dim,
+                             &lr, DT_CENTER | DT_TOP | DT_SINGLELINE);
         }
         const int duty_lines[3] = { 0, 50, 100 };
         for (int i = 0; i < 3; ++i) {
             int duty = duty_lines[i];
-            int y = pad_t + (int)((100.0 - duty) / 100.0 * plot_h + 0.5);
+            int y = ui_curve_y_for_duty(duty, pad_t, plot_h);
             HPEN grid_pen = CreatePen(PS_SOLID, 1, t->panel_alt);
             HGDIOBJ old_pen = SelectObject(mem, grid_pen);
             MoveToEx(mem, pad_l, y, NULL);
-            LineTo(mem, pad_l + plot_w, y);
+            LineTo(mem, plot_r, y);
             SelectObject(mem, old_pen);
             DeleteObject(grid_pen);
             wchar_t label[8];
@@ -1135,42 +1422,87 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
                              &lr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         }
 
-        /* Curve (two-point interpolation, clamped). */
-        double px_per_temp = (double)plot_w / (double)x_max;
-        int cx_low = pad_l + (int)(d->t_low * px_per_temp + 0.5);
-        int cx_high = pad_l + (int)(d->t_high * px_per_temp + 0.5);
-        int cy_low = pad_t + (int)((100.0 - d->d_low) / 100.0 * plot_h + 0.5);
-        int cy_high = pad_t + (int)((100.0 - d->d_high) / 100.0 * plot_h + 0.5);
+        /* Curve with a soft glow, extended flat to both plot edges. */
+        POINT pts[UI_CURVE_MAX_POINTS + 2];
+        int n = 0;
+        pts[n].x = pad_l;
+        pts[n].y = ui_curve_y_for_duty(d->duty[0], pad_t, plot_h);
+        ++n;
+        for (int i = 0; i < d->count; ++i) {
+            pts[n].x = ui_curve_x_for_temp(d->temp[i], pad_l, plot_w);
+            pts[n].y = ui_curve_y_for_duty(d->duty[i], pad_t, plot_h);
+            ++n;
+        }
+        pts[n].x = plot_r;
+        pts[n].y = ui_curve_y_for_duty(d->duty[d->count - 1], pad_t, plot_h);
+        ++n;
 
         HPEN glow_pen = CreatePen(PS_SOLID, 5, RGB(0x27, 0x5A, 0x8C));
         HPEN line_pen = CreatePen(PS_SOLID, 2, t->accent);
         HGDIOBJ old_pen = SelectObject(mem, glow_pen);
-        if (d->t_high <= d->t_low) {
-            MoveToEx(mem, pad_l, cy_low, NULL);
-            LineTo(mem, cx_low, cy_low);
-            LineTo(mem, cx_low, cy_high);
-            LineTo(mem, pad_l + plot_w, cy_high);
-        } else {
-            MoveToEx(mem, pad_l, cy_low, NULL);
-            LineTo(mem, cx_low, cy_low);
-            LineTo(mem, cx_high, cy_high);
-            LineTo(mem, pad_l + plot_w, cy_high);
-        }
+        Polyline(mem, pts, n);
         SelectObject(mem, line_pen);
-        if (d->t_high <= d->t_low) {
-            MoveToEx(mem, pad_l, cy_low, NULL);
-            LineTo(mem, cx_low, cy_low);
-            LineTo(mem, cx_low, cy_high);
-            LineTo(mem, pad_l + plot_w, cy_high);
-        } else {
-            MoveToEx(mem, pad_l, cy_low, NULL);
-            LineTo(mem, cx_low, cy_low);
-            LineTo(mem, cx_high, cy_high);
-            LineTo(mem, pad_l + plot_w, cy_high);
-        }
+        Polyline(mem, pts, n);
         SelectObject(mem, old_pen);
         DeleteObject(glow_pen);
         DeleteObject(line_pen);
+
+        /* Editable points: accent waypoint discs, brighter when active. */
+        for (int i = 0; i < d->count; ++i) {
+            int cx = ui_curve_x_for_temp(d->temp[i], pad_l, plot_w);
+            int cy = ui_curve_y_for_duty(d->duty[i], pad_t, plot_h);
+            int active = (i == d->drag_index || i == d->hover_index);
+            int r = active ? ui_px(6) : ui_px(5);
+            HBRUSH fill =
+                CreateSolidBrush(active ? t->accent_hi : t->accent);
+            HPEN ring = CreatePen(PS_SOLID, 1, t->ink);
+            HGDIOBJ old_brush = SelectObject(mem, fill);
+            HGDIOBJ old_pen = SelectObject(mem, ring);
+            Ellipse(mem, cx - r, cy - r, cx + r + 1, cy + r + 1);
+            SelectObject(mem, old_pen);
+            SelectObject(mem, old_brush);
+            DeleteObject(ring);
+            DeleteObject(fill);
+        }
+
+        /* Cursor crosshair + live temperature -> duty readout. */
+        if (d->mouse_in && d->drag_index < 0) {
+            int temp = ui_curve_temp_at_x(d->mouse_x, pad_l, plot_w);
+            int duty = ui_curve_interpolate(temp, d);
+            int x = ui_curve_x_for_temp(temp, pad_l, plot_w);
+            HPEN guide = CreatePen(PS_SOLID, 1, t->edge_hi);
+            HGDIOBJ old_pen = SelectObject(mem, guide);
+            MoveToEx(mem, x, pad_t, NULL);
+            LineTo(mem, x, plot_b);
+            SelectObject(mem, old_pen);
+            DeleteObject(guide);
+
+            wchar_t label[24];
+            swprintf(label, 24, L"%d°C · %d%%", temp, duty);
+            int tw = ui_px(58);
+            int lx = x + ui_px(8);
+            if (lx + tw > plot_r) {
+                lx = x - ui_px(8) - tw;
+            }
+            int ly = d->mouse_y - ui_px(20);
+            if (ly < pad_t + 2) {
+                ly = d->mouse_y + ui_px(8);
+            }
+            RECT lr;
+            lr.left = lx;
+            lr.top = ly;
+            lr.right = lx + tw;
+            lr.bottom = ly + ui_px(16);
+            RECT sr = lr;
+            sr.left += 1;
+            sr.top += 1;
+            sr.right += 1;
+            sr.bottom += 1;
+            ui_draw_text_hdc(mem, t->font[UI_FONT_MONO], label, t->ink, &sr,
+                             DT_LEFT | DT_TOP | DT_SINGLELINE);
+            ui_draw_text_hdc(mem, t->font[UI_FONT_MONO], label, t->text, &lr,
+                             DT_LEFT | DT_TOP | DT_SINGLELINE);
+        }
 
         /* Current temperature marker. */
         if (d->now_ok) {
@@ -1178,18 +1510,17 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
             if (t_now < 0) {
                 t_now = 0;
             }
-            if (t_now > x_max) {
-                t_now = x_max;
+            if (t_now > 100) {
+                t_now = 100;
             }
-            int dot_x = pad_l + (int)(t_now * px_per_temp + 0.5);
-            int dot_y = pad_t +
-                (int)((100.0 - ui_curve_value_at(d->t_now, d)) / 100.0 * plot_h +
-                      0.5);
+            int dot_x = ui_curve_x_for_temp(t_now, pad_l, plot_w);
+            int dot_y = ui_curve_y_for_duty(ui_curve_interpolate(d->t_now, d),
+                                            pad_t, plot_h);
             RECT dot;
-            dot.left = dot_x - 6;
-            dot.top = dot_y - 6;
-            dot.right = dot_x + 6;
-            dot.bottom = dot_y + 6;
+            dot.left = dot_x - 5;
+            dot.top = dot_y - 5;
+            dot.right = dot_x + 5;
+            dot.bottom = dot_y + 5;
             HBRUSH dot_brush = CreateSolidBrush(t->accent_hi);
             HGDIOBJ old_brush = SelectObject(mem, dot_brush);
             HGDIOBJ old_pen2 = SelectObject(mem, GetStockObject(NULL_PEN));
@@ -1214,7 +1545,8 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
         return 0;
     }
     case WM_DESTROY: {
-        UiCurveData *data = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        UiCurveData *data =
+            (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
         if (data) {
             HeapFree(GetProcessHeap(), 0, data);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1225,17 +1557,88 @@ static LRESULT CALLBACK curve_proc(HWND hwnd, UINT msg, WPARAM wparam,
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-void ui_curve_set_points(HWND hwnd, int temp_low, int duty_low, int temp_high,
-                         int duty_high)
+void ui_curve_set_points(HWND hwnd, int count, const int *temp,
+                         const int *duty)
 {
     UiCurveData *d = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (d) {
-        d->t_low = temp_low;
-        d->d_low = duty_low;
-        d->t_high = temp_high;
-        d->d_high = duty_high;
-        InvalidateRect(hwnd, NULL, FALSE);
+    if (!d || count < 2 || count > UI_CURVE_MAX_POINTS || !temp || !duty) {
+        return;
     }
+    int t[UI_CURVE_MAX_POINTS];
+    int v[UI_CURVE_MAX_POINTS];
+    for (int i = 0; i < count; ++i) {
+        t[i] = temp[i];
+        if (t[i] < 0) {
+            t[i] = 0;
+        }
+        if (t[i] > 100) {
+            t[i] = 100;
+        }
+        v[i] = duty[i];
+        if (v[i] < 0) {
+            v[i] = 0;
+        }
+        if (v[i] > 100) {
+            v[i] = 100;
+        }
+    }
+    /* Sort by temperature (insertion sort, stable). */
+    for (int i = 1; i < count; ++i) {
+        int ct = t[i];
+        int cv = v[i];
+        int j = i - 1;
+        while (j >= 0 && t[j] > ct) {
+            t[j + 1] = t[j];
+            v[j + 1] = v[j];
+            --j;
+        }
+        t[j + 1] = ct;
+        v[j + 1] = cv;
+    }
+    /* Collapse duplicate temperatures (last value wins). */
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        if (n > 0 && t[i] == t[n - 1]) {
+            v[n - 1] = v[i];
+        } else {
+            t[n] = t[i];
+            v[n] = v[i];
+            ++n;
+        }
+    }
+    if (n < 2) {
+        return;
+    }
+    d->count = n;
+    for (int i = 0; i < n; ++i) {
+        d->temp[i] = t[i];
+        d->duty[i] = v[i];
+    }
+    d->hover_index = -1;
+    d->drag_index = -1;
+    d->drag_is_add = 0;
+    d->drag_moved = 0;
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+int ui_curve_get_points(HWND hwnd, int *count, int *temp, int *duty)
+{
+    UiCurveData *d = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!d || !count || !temp || !duty) {
+        return 0;
+    }
+    for (int i = 0; i < d->count; ++i) {
+        temp[i] = d->temp[i];
+        duty[i] = d->duty[i];
+    }
+    *count = d->count;
+    return d->count;
+}
+
+int ui_curve_value_at(HWND hwnd, int temp)
+{
+    UiCurveData *d = (UiCurveData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    return d ? ui_curve_interpolate(temp, d) : 0;
 }
 
 void ui_curve_set_now(HWND hwnd, int temperature_c, bool ok)
@@ -1247,7 +1650,6 @@ void ui_curve_set_now(HWND hwnd, int temperature_c, bool ok)
         InvalidateRect(hwnd, NULL, FALSE);
     }
 }
-
 /* -------------------------------------------------------------- dot */
 
 typedef struct UiDotData {

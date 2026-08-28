@@ -32,10 +32,6 @@
 #define IDC_TEMP_BASE 700
 #define IDC_VOLT_BASE 800
 #define IDC_GPU_STATUS 900
-#define IDC_GPU_TEMP_LOW 901
-#define IDC_GPU_DUTY_LOW 902
-#define IDC_GPU_TEMP_HIGH 903
-#define IDC_GPU_DUTY_HIGH 904
 #define IDC_AUTOSTART 905
 #define IDC_SAVE_SETTINGS 906
 #define REFRESH_TIMER 1
@@ -113,18 +109,14 @@ typedef struct AppState {
     HWND autostart_checkbox;
     HWND save_btn;
     HWND status_label;
-    /* GPU curve edits */
-    HWND gpu_temp_low_edit;
-    HWND gpu_duty_low_edit;
-    HWND gpu_temp_high_edit;
-    HWND gpu_duty_high_edit;
+    /* GPU curve */
+    HWND curve_hint;
+    HWND curve_hint2;
     /* Panel headings / static labels (moved by layout) */
     HWND fans_heading;
     HWND sensors_heading;
     HWND rails_heading;
     HWND curve_heading;
-    HWND low_high_labels[2];
-    HWND pct_labels[2];
     HWND controller_heading;
     HWND ctrl_row_labels[4];
     HWND options_heading;
@@ -160,7 +152,6 @@ typedef struct AppState {
 static AppState g_app;
 
 static int selected_device_index(AppState *app);
-static int edit_int(HWND edit, int fallback);
 static int clamp_int(int value, int min_value, int max_value);
 static void update_duty_label(AppState *app, int fan);
 static void show_device_settings(AppState *app, int device_index);
@@ -188,7 +179,6 @@ static void create_main_controls(AppState *app, HWND hwnd);
 static void create_overview_controls(AppState *app, HWND hwnd);
 static void update_overview_view(AppState *app);
 static void update_visual_state(AppState *app);
-static void update_curve_points(AppState *app);
 static void update_device_subtitle(AppState *app);
 static const wchar_t *fan_profile_name(int mode_index);
 static void show_overview_window(AppState *app);
@@ -475,13 +465,6 @@ static int find_device_by_key(AppState *app, const wchar_t *key)
     return -1;
 }
 
-static void set_edit_int(HWND edit, int value)
-{
-    wchar_t text[32];
-    swprintf(text, sizeof(text) / sizeof(text[0]), L"%d", value);
-    SetWindowTextW(edit, text);
-}
-
 /* ========================================================= fake device */
 
 static int g_fake_duty[CORSAIR_FAN_COUNT];
@@ -652,6 +635,48 @@ static bool load_fan_settings_from_key(ControllerRuntime *controller, HKEY key)
     return any;
 }
 
+/* Parse "25:30,80:100" into point arrays; requires 2..16 valid points. */
+static bool parse_curve_points(const wchar_t *text, int *temps, int *duties,
+                               int *count)
+{
+    int n = 0;
+    const wchar_t *p = text;
+
+    while (*p != L'\0') {
+        wchar_t *end1 = NULL;
+        long temp_value = wcstol(p, &end1, 10);
+        if (end1 == p || *end1 != L':') {
+            return false;
+        }
+        wchar_t *end2 = NULL;
+        long duty_value = wcstol(end1 + 1, &end2, 10);
+        if (end2 == end1 + 1 || temp_value < 0 || temp_value > 100 ||
+            duty_value < 0 || duty_value > 100 || n >= 16) {
+            return false;
+        }
+        temps[n] = (int)temp_value;
+        duties[n] = (int)duty_value;
+        ++n;
+        p = end2;
+        while (*p == L' ') {
+            ++p;
+        }
+        if (*p == L'\0') {
+            break;
+        }
+        if (*p != L',') {
+            return false;
+        }
+        ++p;
+        while (*p == L' ') {
+            ++p;
+        }
+    }
+
+    *count = n;
+    return n >= 2;
+}
+
 static void load_global_settings(AppState *app)
 {
     HKEY key;
@@ -666,14 +691,35 @@ static void load_global_settings(AppState *app)
     settings_read_string(key, L"LastDeviceKey", app->last_device_key,
                          (DWORD)(sizeof(app->last_device_key) /
                                  sizeof(app->last_device_key[0])));
-    set_edit_int(app->gpu_temp_low_edit,
-                 (int)settings_read_dword(key, L"GpuTempLow", 40));
-    set_edit_int(app->gpu_duty_low_edit,
-                 (int)settings_read_dword(key, L"GpuDutyLow", 25));
-    set_edit_int(app->gpu_temp_high_edit,
-                 (int)settings_read_dword(key, L"GpuTempHigh", 80));
-    set_edit_int(app->gpu_duty_high_edit,
-                 (int)settings_read_dword(key, L"GpuDutyHigh", 100));
+    /* Multi-point curve: GpuCurvePts ("25:30,80:100"). Without a saved or
+     * valid curve the control defaults apply (25 deg C -> 30% and
+     * 80 deg C -> 100%); legacy two-point settings are migrated once. */
+    {
+        wchar_t curve_pts[512];
+        int temps[16];
+        int duties[16];
+        int point_count = 0;
+        bool loaded = settings_read_string(
+            key, L"GpuCurvePts", curve_pts,
+            (DWORD)(sizeof(curve_pts) / sizeof(curve_pts[0]))) &&
+                      parse_curve_points(curve_pts, temps, duties,
+                                         &point_count);
+        if (loaded) {
+            ui_curve_set_points(app->curve_graph, point_count, temps, duties);
+        } else {
+            DWORD temp_low = 0;
+            DWORD temp_high = 0;
+            if (settings_try_read_dword(key, L"GpuTempLow", &temp_low) &&
+                settings_try_read_dword(key, L"GpuTempHigh", &temp_high)) {
+                int legacy_t[2] = { (int)temp_low, (int)temp_high };
+                int legacy_d[2] = {
+                    (int)settings_read_dword(key, L"GpuDutyLow", 25),
+                    (int)settings_read_dword(key, L"GpuDutyHigh", 100)
+                };
+                ui_curve_set_points(app->curve_graph, 2, legacy_t, legacy_d);
+            }
+        }
+    }
 
     RegCloseKey(key);
 }
@@ -725,14 +771,28 @@ static void save_global_settings(AppState *app)
         app->saved_device_index = device_index;
     }
 
-    settings_write_dword(key, L"GpuTempLow",
-                         (DWORD)clamp_int(edit_int(app->gpu_temp_low_edit, 40), 0, 120));
-    settings_write_dword(key, L"GpuDutyLow",
-                         (DWORD)clamp_int(edit_int(app->gpu_duty_low_edit, 25), 0, 100));
-    settings_write_dword(key, L"GpuTempHigh",
-                         (DWORD)clamp_int(edit_int(app->gpu_temp_high_edit, 80), 0, 120));
-    settings_write_dword(key, L"GpuDutyHigh",
-                         (DWORD)clamp_int(edit_int(app->gpu_duty_high_edit, 100), 0, 100));
+    {
+        int temps[16];
+        int duties[16];
+        int point_count = ui_curve_get_points(app->curve_graph, &point_count,
+                                              temps, duties);
+        if (point_count >= 2) {
+            wchar_t curve_pts[512];
+            int pos = 0;
+            for (int i = 0; i < point_count; ++i) {
+                pos += swprintf(&curve_pts[pos], 16, L"%d:%d%s", temps[i],
+                                duties[i], i + 1 < point_count ? L"," : L"");
+            }
+            settings_write_string(key, L"GpuCurvePts", curve_pts);
+            /* Keep the legacy two-point values for older builds. */
+            settings_write_dword(key, L"GpuTempLow", (DWORD)temps[0]);
+            settings_write_dword(key, L"GpuDutyLow", (DWORD)duties[0]);
+            settings_write_dword(key, L"GpuTempHigh",
+                                 (DWORD)temps[point_count - 1]);
+            settings_write_dword(key, L"GpuDutyHigh",
+                                 (DWORD)duties[point_count - 1]);
+        }
+    }
 
     RegCloseKey(key);
 }
@@ -888,23 +948,6 @@ static int selected_device_index(AppState *app)
     return index;
 }
 
-static int edit_int(HWND edit, int fallback)
-{
-    wchar_t text[32];
-    wchar_t *end = NULL;
-    long value;
-
-    if (GetWindowTextW(edit, text, (int)(sizeof(text) / sizeof(text[0]))) <= 0) {
-        return fallback;
-    }
-
-    value = wcstol(text, &end, 10);
-    if (end == text) {
-        return fallback;
-    }
-    return (int)value;
-}
-
 static int clamp_int(int value, int min_value, int max_value)
 {
     if (value < min_value) {
@@ -916,25 +959,11 @@ static int clamp_int(int value, int min_value, int max_value)
     return value;
 }
 
+/* Live duty from the interactive curve graph (0-100 on both axes). */
 static int nvidia_curve_duty(AppState *app)
 {
-    int temp_low = clamp_int(edit_int(app->gpu_temp_low_edit, 40), 0, 120);
-    int duty_low = clamp_int(edit_int(app->gpu_duty_low_edit, 25), 0, 100);
-    int temp_high = clamp_int(edit_int(app->gpu_temp_high_edit, 80), 0, 120);
-    int duty_high = clamp_int(edit_int(app->gpu_duty_high_edit, 100), 0, 100);
-    int temp = app->gpu.temperature_c;
-
-    if (temp_high <= temp_low) {
-        return temp >= temp_low ? duty_high : duty_low;
-    }
-    if (temp <= temp_low) {
-        return duty_low;
-    }
-    if (temp >= temp_high) {
-        return duty_high;
-    }
-
-    return duty_low + ((temp - temp_low) * (duty_high - duty_low)) / (temp_high - temp_low);
+    return clamp_int(ui_curve_value_at(app->curve_graph, app->gpu.temperature_c),
+                     0, 100);
 }
 
 static void update_controls_enabled(AppState *app)
@@ -1004,15 +1033,6 @@ static void refresh_gpu_status(AppState *app)
         copy_wstr(readout, sizeof(readout) / sizeof(readout[0]), L"— °C");
     }
     SetWindowTextW(app->gpu_readout, readout);
-}
-
-static void update_curve_points(AppState *app)
-{
-    ui_curve_set_points(app->curve_graph,
-                        clamp_int(edit_int(app->gpu_temp_low_edit, 40), 0, 120),
-                        clamp_int(edit_int(app->gpu_duty_low_edit, 25), 0, 100),
-                        clamp_int(edit_int(app->gpu_temp_high_edit, 80), 0, 120),
-                        clamp_int(edit_int(app->gpu_duty_high_edit, 100), 0, 100));
 }
 
 static void update_visual_state(AppState *app)
@@ -2218,49 +2238,18 @@ static void create_main_controls(AppState *app, HWND hwnd)
     ui_register_ctrl(app->gpu_status_label, UI_BG_PANEL, t->dim);
 
     app->curve_graph = ui_make_control(hwnd, UI_CLASS_CURVE, 0, x_r + ui_px(12),
-                                       ui_px(124), ui_px(240), ui_px(128), 0);
+                                       ui_px(124), ui_px(240), ui_px(130), 0);
 
-    app->low_high_labels[0] = make_child(hwnd, WC_STATICW, L"LOW", SS_LEFT,
-                                         x_r + ui_px(12), ui_px(186), ui_px(30),
-                                         ui_px(14), 0);
-    ui_register_font_role(app->low_high_labels[0], UI_FONT_CAPTION);
-    ui_register_ctrl(app->low_high_labels[0], UI_BG_PANEL, t->dim);
-    app->gpu_temp_low_edit = make_child(hwnd, WC_EDITW, L"40", ES_NUMBER | WS_TABSTOP,
-                                        x_r + ui_px(48), ui_px(187), ui_px(48), ui_px(20),
-                                        IDC_GPU_TEMP_LOW);
-    ui_register_font_role(app->gpu_temp_low_edit, UI_FONT_MONO);
-    ui_register_ctrl(app->gpu_temp_low_edit, UI_BG_INK, t->text);
-    app->gpu_duty_low_edit = make_child(hwnd, WC_EDITW, L"25", ES_NUMBER | WS_TABSTOP,
-                                        x_r + ui_px(106), ui_px(187), ui_px(48), ui_px(20),
-                                        IDC_GPU_DUTY_LOW);
-    ui_register_font_role(app->gpu_duty_low_edit, UI_FONT_MONO);
-    ui_register_ctrl(app->gpu_duty_low_edit, UI_BG_INK, t->text);
-    app->pct_labels[0] = make_child(hwnd, WC_STATICW, L"%", SS_LEFT,
-                                    x_r + ui_px(160), ui_px(187), ui_px(20), ui_px(14),
-                                    0);
-    ui_register_font_role(app->pct_labels[0], UI_FONT_CAPTION);
-    ui_register_ctrl(app->pct_labels[0], UI_BG_PANEL, t->dim);
-
-    app->low_high_labels[1] = make_child(hwnd, WC_STATICW, L"HIGH", SS_LEFT,
-                                         x_r + ui_px(12), ui_px(220), ui_px(30),
-                                         ui_px(14), 0);
-    ui_register_font_role(app->low_high_labels[1], UI_FONT_CAPTION);
-    ui_register_ctrl(app->low_high_labels[1], UI_BG_PANEL, t->dim);
-    app->gpu_temp_high_edit = make_child(hwnd, WC_EDITW, L"80", ES_NUMBER | WS_TABSTOP,
-                                         x_r + ui_px(48), ui_px(221), ui_px(48), ui_px(20),
-                                         IDC_GPU_TEMP_HIGH);
-    ui_register_font_role(app->gpu_temp_high_edit, UI_FONT_MONO);
-    ui_register_ctrl(app->gpu_temp_high_edit, UI_BG_INK, t->text);
-    app->gpu_duty_high_edit = make_child(hwnd, WC_EDITW, L"100", ES_NUMBER | WS_TABSTOP,
-                                         x_r + ui_px(106), ui_px(221), ui_px(48), ui_px(20),
-                                         IDC_GPU_DUTY_HIGH);
-    ui_register_font_role(app->gpu_duty_high_edit, UI_FONT_MONO);
-    ui_register_ctrl(app->gpu_duty_high_edit, UI_BG_INK, t->text);
-    app->pct_labels[1] = make_child(hwnd, WC_STATICW, L"%", SS_LEFT,
-                                    x_r + ui_px(160), ui_px(221), ui_px(20), ui_px(14),
-                                    0);
-    ui_register_font_role(app->pct_labels[1], UI_FONT_CAPTION);
-    ui_register_ctrl(app->pct_labels[1], UI_BG_PANEL, t->dim);
+    app->curve_hint = make_child(
+        hwnd, WC_STATICW, L"right-click add \u00b7 drag move", SS_LEFT,
+        x_r + ui_px(12), ui_px(282), ui_px(240), ui_px(14), 0);
+    ui_register_font_role(app->curve_hint, UI_FONT_CAPTION);
+    ui_register_ctrl(app->curve_hint, UI_BG_PANEL, t->dim);
+    app->curve_hint2 = make_child(
+        hwnd, WC_STATICW, L"double-click remove", SS_LEFT, x_r + ui_px(12),
+        ui_px(297), ui_px(240), ui_px(14), 0);
+    ui_register_font_role(app->curve_hint2, UI_FONT_CAPTION);
+    ui_register_ctrl(app->curve_hint2, UI_BG_PANEL, t->dim);
 
     app->controller_panel = ui_make_control(hwnd, UI_CLASS_PANEL, 0, x_r,
                                             ui_px(340), ui_px(264), ui_px(150), 0);
@@ -2348,18 +2337,6 @@ static void create_main_controls(AppState *app, HWND hwnd)
     ui_register_font_role(app->status_label, UI_FONT_CAPTION);
     ui_register_ctrl(app->status_label, UI_BG_INK, t->dim);
 
-    /* The GPU-curve edit controls sit inside the curve panel; raise them to
-     * the top of the Z-order so their background chips / the curve graph do
-     * not intercept mouse input. */
-    SetWindowPos(app->gpu_temp_low_edit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetWindowPos(app->gpu_duty_low_edit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetWindowPos(app->gpu_temp_high_edit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetWindowPos(app->gpu_duty_high_edit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    InvalidateRect(app->gpu_temp_low_edit, NULL, FALSE);
-    InvalidateRect(app->gpu_duty_low_edit, NULL, FALSE);
-    InvalidateRect(app->gpu_temp_high_edit, NULL, FALSE);
-    InvalidateRect(app->gpu_duty_high_edit, NULL, FALSE);
-
     /* Keep the background panels at the very bottom of the Z-order. With
      * WS_CLIPSIBLINGS they then clip out every sibling above them, so a
      * panel repaint can never erase the pixels of the controls sitting on
@@ -2378,7 +2355,6 @@ static void create_main_controls(AppState *app, HWND hwnd)
                     SWP_NOMOVE | SWP_NOSIZE);
 
     load_global_settings(app);
-    update_curve_points(app);
     refresh_gpu_status(app);
     update_controls_enabled(app);
     update_device_subtitle(app);
@@ -2497,23 +2473,11 @@ static void layout_main(AppState *app)
     MoveWindow(app->gpu_status_label, x_r + ui_px(12), body_top + ui_px(30),
                right_w - ui_px(24), ui_px(16), TRUE);
     MoveWindow(app->curve_graph, x_r + ui_px(12), body_top + ui_px(50),
-               right_w - ui_px(24), curve_h - ui_px(190), TRUE);
-    MoveWindow(app->low_high_labels[0], x_r + ui_px(12), body_top + curve_h - ui_px(67),
-               ui_px(30), ui_px(14), TRUE);
-    MoveWindow(app->pct_labels[0], x_r + ui_px(160), body_top + curve_h - ui_px(67),
-               ui_px(20), ui_px(14), TRUE);
-    MoveWindow(app->gpu_temp_low_edit, x_r + ui_px(48), body_top + curve_h - ui_px(65),
-               ui_px(48), ui_px(20), TRUE);
-    MoveWindow(app->gpu_duty_low_edit, x_r + ui_px(106), body_top + curve_h - ui_px(65),
-               ui_px(48), ui_px(20), TRUE);
-    MoveWindow(app->low_high_labels[1], x_r + ui_px(12), body_top + curve_h - ui_px(33),
-               ui_px(30), ui_px(14), TRUE);
-    MoveWindow(app->pct_labels[1], x_r + ui_px(160), body_top + curve_h - ui_px(33),
-               ui_px(20), ui_px(14), TRUE);
-    MoveWindow(app->gpu_temp_high_edit, x_r + ui_px(48), body_top + curve_h - ui_px(31),
-               ui_px(48), ui_px(20), TRUE);
-    MoveWindow(app->gpu_duty_high_edit, x_r + ui_px(106), body_top + curve_h - ui_px(31),
-               ui_px(48), ui_px(20), TRUE);
+               right_w - ui_px(24), curve_h - ui_px(100), TRUE);
+    MoveWindow(app->curve_hint, x_r + ui_px(12), body_top + curve_h - ui_px(46),
+               right_w - ui_px(24), ui_px(14), TRUE);
+    MoveWindow(app->curve_hint2, x_r + ui_px(12), body_top + curve_h - ui_px(31),
+               right_w - ui_px(24), ui_px(14), TRUE);
 
     int controller_top = body_top + curve_h + gap;
     MoveWindow(app->controller_panel, x_r, controller_top, right_w, ctrl_h, TRUE);
@@ -2667,15 +2631,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 save_settings(app);
                 update_overview_view(app);
             }
-        } else if ((id == IDC_GPU_TEMP_LOW || id == IDC_GPU_DUTY_LOW ||
-                    id == IDC_GPU_TEMP_HIGH || id == IDC_GPU_DUTY_HIGH) &&
-                   HIWORD(wparam) == EN_KILLFOCUS) {
-            update_curve_points(app);
-            save_settings(app);
-            update_overview_view(app);
         }
         return 0;
     }
+
+    case UI_MSG_CURVE_CHANGED:
+        save_settings(app);
+        update_overview_view(app);
+        set_status(app, L"Curve updated.");
+        return 0;
 
     case WM_HSCROLL:
         for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {

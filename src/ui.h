@@ -88,9 +88,16 @@ void ui_combo_set_items(HWND hwnd, int count, const wchar_t *const *items);
 void ui_combo_set_selected(HWND hwnd, int index);
 int ui_combo_selected(HWND hwnd);
 
-/* GPU two-point curve ------------------------------------------------------ */
-void ui_curve_set_points(HWND hwnd, int temp_low, int duty_low,
-                         int temp_high, int duty_high);
+/* GPU curve (interactive editor, both axes fixed to 0-100) ---------------
+ * x = GPU temperature (deg C), y = fan duty (%). Right-click adds a point,
+ * dragging moves it, right-click on a point (without dragging) or
+ * double-click removes it (minimum 2 points). Every committed change posts
+ * UI_MSG_CURVE_CHANGED to the parent window. */
+#define UI_MSG_CURVE_CHANGED (WM_APP + 10)
+void ui_curve_set_points(HWND hwnd, int count, const int *temp,
+                         const int *duty);
+int ui_curve_get_points(HWND hwnd, int *count, int *temp, int *duty);
+int ui_curve_value_at(HWND hwnd, int temp);
 void ui_curve_set_now(HWND hwnd, int temperature_c, bool ok);
 
 /* Status dot --------------------------------------------------------------- */
