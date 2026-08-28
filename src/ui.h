@@ -109,19 +109,18 @@ void ui_register_font_role(HWND hwnd, int role);
 void ui_register_ctrl(HWND hwnd, int bg, COLORREF color); /* color 0 = text  */
 void ui_apply_fonts(HWND hwnd);                       /* re-send WM_SETFONT  */
 
-/* Dark list view setup: background colors, owner-drawn rows and header.
- * Call once after ListView creation (list must be created with
- * LVS_REPORT | LVS_OWNERDATA). Row cells are drawn on demand through
- * text_fn. */
+/* Dark list view setup: custom-drawn rows and a dark header.
+ * Call once after ListView creation (list must be created with LVS_REPORT
+ * and as a child of a CfcPanel window). Row cells are drawn on demand
+ * through text_fn via the panel's NM_CUSTOMDRAW handling; row backgrounds
+ * and per-cell text colors follow the dark theme. */
 typedef void (*UiListTextFn)(void *ctx, int row, int col, wchar_t *text,
                              int text_count);
 void ui_dark_listview(HWND list, unsigned numeric_mask, UiListTextFn text_fn,
                       void *ctx);
-bool ui_list_handle_measure(HWND list, MEASUREITEMSTRUCT *mi);
-bool ui_list_handle_draw(HWND list, DRAWITEMSTRUCT *dis);
 
-/* Attach an owner-draw list view to a panel window. The list view must be
- * created as a child of the panel; the panel then answers the list view's
- * WM_MEASUREITEM / WM_DRAWITEM messages (the sender cannot be told apart
- * from the message parameters alone). */
+/* Attach a dark list view to a panel window. The list view must be created
+ * as a child of the panel; the panel then answers the list view's
+ * WM_NOTIFY (NM_CUSTOMDRAW) and WM_CTLCOLORLISTVIEW messages, which the
+ * list view sends to its parent. */
 void ui_panel_attach_list(HWND panel, HWND list);

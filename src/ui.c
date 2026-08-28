@@ -7,7 +7,7 @@
 #include <string.h>
 
 #ifndef WM_CTLCOLORLISTVIEW
-#define WM_CTLCOLORLISTVIEW 0x013E
+#define WM_CTLCOLORLISTVIEW 0x013C  /* Win8+ comctl32; not in older winuser.h */
 #endif
 
 /* ------------------------------------------------------------------ theme */
@@ -37,7 +37,6 @@ static LRESULT CALLBACK slider_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK combo_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK curve_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK dot_proc(HWND, UINT, WPARAM, LPARAM);
-static LRESULT CALLBACK listview_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK header_proc(HWND, UINT, WPARAM, LPARAM);
 
 /* ------------------------------------------------------------------ theme */
@@ -370,13 +369,15 @@ HWND ui_make_control(HWND parent, const wchar_t *class_name, DWORD extra_style,
 
 /* ----------------------------------------------------------------- panels */
 
+/* Owner-draw hook for the list views that live inside a panel. The panel is
+ * the list view's parent, so it receives the list view's WM_NOTIFY (incl.
+ * NM_CUSTOMDRAW) and WM_CTLCOLORLISTVIEW. */
+static LRESULT ui_list_handle_customdraw(HWND list, NMLVCUSTOMDRAW *cd);
+
 static LRESULT CALLBACK panel_proc(HWND hwnd, UINT msg, WPARAM wparam,
                                    LPARAM lparam)
 {
-    (void)wparam;
-    (void)lparam;
     UiTheme *t = &g_theme;
-
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -392,17 +393,22 @@ static LRESULT CALLBACK panel_proc(HWND hwnd, UINT msg, WPARAM wparam,
     }
     case WM_ERASEBKGND:
         return 1;
-    case WM_MEASUREITEM: {
+    case WM_CTLCOLORLISTVIEW: {
+        /* Sent to the list view's parent (this panel). */
         HWND list = ui_panel_list(hwnd);
-        if (list && (HWND)wparam == list) {
-            return ui_list_handle_measure(list, (MEASUREITEMSTRUCT *)lparam);
+        if (list && (HWND)lparam == list) {
+            HDC hdc = (HDC)wparam;
+            SetBkColor(hdc, t->ink);
+            SetTextColor(hdc, t->text);
+            return (LRESULT)t->ink_brush;
         }
         break;
     }
-    case WM_DRAWITEM: {
+    case WM_NOTIFY: {
+        NMHDR *nm = (NMHDR *)lparam;
         HWND list = ui_panel_list(hwnd);
-        if (list && (HWND)wparam == list) {
-            return ui_list_handle_draw(list, (DRAWITEMSTRUCT *)lparam);
+        if (list && (HWND)nm->hwndFrom == list && nm->code == NM_CUSTOMDRAW) {
+            return ui_list_handle_customdraw(list, (NMLVCUSTOMDRAW *)lparam);
         }
         break;
     }
@@ -1345,7 +1351,6 @@ typedef struct UiListState {
     unsigned numeric_mask;
     UiListTextFn text_fn;
     void *ctx;
-    LRESULT CALLBACK (*old_list_proc)(HWND, UINT, WPARAM, LPARAM);
     LRESULT CALLBACK (*old_header_proc)(HWND, UINT, WPARAM, LPARAM);
 } UiListState;
 
@@ -1355,6 +1360,17 @@ static UiListState *ui_list_find(HWND list)
 {
     for (int i = 0; i < UI_LIST_MAX; ++i) {
         if (g_lists[i].list == list) {
+            return &g_lists[i];
+        }
+    }
+    return NULL;
+}
+
+static UiListState *ui_list_find_by_header(HWND header)
+{
+    for (int i = 0; i < UI_LIST_MAX; ++i) {
+        if (g_lists[i].list && IsWindow(g_lists[i].list) &&
+            g_lists[i].header == header) {
             return &g_lists[i];
         }
     }
@@ -1383,135 +1399,139 @@ static COLORREF ui_list_text_color(const wchar_t *text)
     return t->text;
 }
 
-bool ui_list_handle_measure(HWND list, MEASUREITEMSTRUCT *mi)
+/* Custom draw for the dark list views. The list view is a standard
+ * LVS_REPORT control; its rows exist but carry no text. This handler draws
+ * each visible row: background (selection / zebra striping) plus one cell
+ * per column, with the cell text supplied on demand through text_fn and the
+ * per-cell text color from ui_list_text_color. */
+static LRESULT ui_list_handle_customdraw(HWND list, NMLVCUSTOMDRAW *cd)
 {
     UiListState *ls = ui_list_find(list);
-    if (!ls) {
-        return false;
-    }
-    int row = HIWORD((DWORD)mi->itemID);
-    int sub = LOWORD((DWORD)mi->itemID);
-    LVCOLUMNW col;
-    ZeroMemory(&col, sizeof(col));
-    col.mask = LVCF_WIDTH;
-    ListView_GetColumn(list, sub, &col);
-    mi->itemWidth = (UINT)(col.cx + ui_px(16));
-    mi->itemHeight = (UINT)ui_px(24);
-    (void)row;
-    return true;
-}
 
-bool ui_list_handle_draw(HWND list, DRAWITEMSTRUCT *dis)
-{
-    UiListState *ls = ui_list_find(list);
     if (!ls || !ls->text_fn) {
-        return false;
+        return CDRF_DODEFAULT;
     }
     UiTheme *t = &g_theme;
-    int row = HIWORD((DWORD)dis->itemID);
-    int sub = LOWORD((DWORD)dis->itemID);
 
-    COLORREF bg;
-    if (dis->itemState & ODS_SELECTED) {
-        bg = RGB((GetRValue(t->ink) * 3 + GetRValue(t->accent)) / 4,
-                 (GetGValue(t->ink) * 3 + GetGValue(t->accent)) / 4,
-                 (GetBValue(t->ink) * 3 + GetBValue(t->accent)) / 4);
-    } else {
-        bg = (row % 2 == 0) ? t->ink : t->row_alt;
+    switch (cd->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+    case CDDS_ITEMPREPAINT: {
+        int row = (int)cd->nmcd.dwItemSpec;
+        int col_count = ls->header
+                            ? (int)SendMessageW(ls->header, HDM_GETITEMCOUNT, 0, 0)
+                            : 0;
+        if (col_count <= 0) {
+            return CDRF_SKIPDEFAULT;
+        }
+
+        BOOL selected =
+            (ListView_GetItemState(list, row, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+        COLORREF bg;
+        if (selected) {
+            bg = RGB((GetRValue(t->ink) * 3 + GetRValue(t->accent)) / 4,
+                     (GetGValue(t->ink) * 3 + GetGValue(t->accent)) / 4,
+                     (GetBValue(t->ink) * 3 + GetBValue(t->accent)) / 4);
+        } else {
+            bg = (row % 2 == 0) ? t->ink : t->row_alt;
+        }
+
+        /* Full-width row band (the list view may be wider than the columns). */
+        RECT item_rc;
+        ZeroMemory(&item_rc, sizeof(item_rc));
+        ListView_GetItemRect(list, row, &item_rc, LVIR_BOUNDS);
+        RECT client;
+        GetClientRect(list, &client);
+        RECT band = { 0, item_rc.top, client.right, item_rc.bottom };
+        HBRUSH bg_brush = CreateSolidBrush(bg);
+        FillRect(cd->nmcd.hdc, &band, bg_brush);
+        DeleteObject(bg_brush);
+
+        for (int sub = 0; sub < col_count; ++sub) {
+            RECT cell;
+            if (!ListView_GetSubItemRect(list, row, sub, LVIR_BOUNDS, &cell)) {
+                continue;
+            }
+            wchar_t text[160];
+            text[0] = L'\0';
+            ls->text_fn(ls->ctx, row, sub, text, 160);
+
+            HFONT font = (ls->numeric_mask & (1u << sub)) ? t->font[UI_FONT_MONO]
+                                                          : t->font[UI_FONT_BODY];
+            HGDIOBJ old_font = SelectObject(cd->nmcd.hdc, font);
+            SetTextColor(cd->nmcd.hdc, ui_list_text_color(text));
+            SetBkMode(cd->nmcd.hdc, TRANSPARENT);
+            RECT r = cell;
+            r.left += ui_px(8);
+            r.right -= ui_px(8);
+            DrawTextW(cd->nmcd.hdc, text, -1, &r,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(cd->nmcd.hdc, old_font);
+        }
+        return CDRF_SKIPDEFAULT;
     }
-    HBRUSH bg_brush = CreateSolidBrush(bg);
-    FillRect(dis->hDC, &dis->rcItem, bg_brush);
-    DeleteObject(bg_brush);
-
-    wchar_t text[160];
-    text[0] = L'\0';
-    ls->text_fn(ls->ctx, row, sub, text, 160);
-
-    HFONT font = (ls->numeric_mask & (1u << sub)) ? t->font[UI_FONT_MONO]
-                                                  : t->font[UI_FONT_BODY];
-    HGDIOBJ old_font = SelectObject(dis->hDC, font);
-    SetTextColor(dis->hDC, ui_list_text_color(text));
-    SetBkMode(dis->hDC, TRANSPARENT);
-    RECT r = dis->rcItem;
-    r.left += ui_px(8);
-    r.right -= ui_px(8);
-    DrawTextW(dis->hDC, text, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dis->hDC, old_font);
-    return true;
+    default:
+        return CDRF_DODEFAULT;
+    }
 }
 
-static LRESULT CALLBACK listview_proc(HWND hwnd, UINT msg, WPARAM wparam,
-                                      LPARAM lparam)
+/* Draw the list view's header control fully by hand: dark panel background
+ * plus the column titles (taken from the list view's columns) in the dim
+ * heading font. The default header draw would use the light system theme, so
+ * the titles must be drawn here. */
+static void ui_draw_header(HWND header, UiListState *ls, HDC hdc)
 {
-    UiListState *ls = (UiListState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     UiTheme *t = &g_theme;
+    RECT rc;
+    GetClientRect(header, &rc);
+    FillRect(hdc, &rc, t->panel_brush);
 
-    if (ls) {
-        if (msg == WM_CTLCOLORLISTBOX || msg == WM_CTLCOLORLISTVIEW) {
-            HDC hdc = (HDC)wparam;
-            SetBkColor(hdc, t->ink);
-            SetTextColor(hdc, t->text);
-            return (LRESULT)t->ink_brush;
-        }
-        if (msg == WM_MEASUREITEM && (HWND)wparam == ls->header) {
-            MEASUREITEMSTRUCT *mi = (MEASUREITEMSTRUCT *)lparam;
-            int col = (int)mi->itemID;
-            LVCOLUMNW coldef;
-            ZeroMemory(&coldef, sizeof(coldef));
-            wchar_t title[64];
-            ZeroMemory(title, sizeof(title));
-            coldef.mask = LVCF_TEXT;
-            coldef.pszText = title;
-            ListView_GetColumn(ls->list, col, &coldef);
-            HDC dc = GetDC(NULL);
-            HFONT old = (HFONT)SelectObject(dc, t->font[UI_FONT_HEADING]);
-            SIZE sz;
-            GetTextExtentPoint32W(dc, title, (int)wcslen(title), &sz);
-            SelectObject(dc, old);
-            ReleaseDC(NULL, dc);
-            mi->itemWidth = (UINT)(sz.cx + ui_px(24));
-            mi->itemHeight = (UINT)ui_px(26);
-            return TRUE;
-        }
-        if (msg == WM_DRAWITEM && (HWND)wparam == ls->header) {
-            DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lparam;
-            int col = (int)dis->itemID;
-            wchar_t title[64];
-            ZeroMemory(title, sizeof(title));
-            LVCOLUMNW coldef;
-            ZeroMemory(&coldef, sizeof(coldef));
-            coldef.mask = LVCF_TEXT;
-            coldef.pszText = title;
-            ListView_GetColumn(ls->list, col, &coldef);
-            FillRect(dis->hDC, &dis->rcItem, t->panel_brush);
-            RECT r = dis->rcItem;
-            r.left += ui_px(10);
-            HFONT old = (HFONT)SelectObject(dis->hDC, t->font[UI_FONT_HEADING]);
-            SetTextColor(dis->hDC, t->dim);
-            SetBkMode(dis->hDC, TRANSPARENT);
-            DrawTextW(dis->hDC, title, -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(dis->hDC, old);
-            return TRUE;
-        }
+    int n = (int)SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
+    if (n <= 0) {
+        return;
     }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
+    HGDIOBJ old_font = SelectObject(hdc, t->font[UI_FONT_HEADING]);
+    SetTextColor(hdc, t->dim);
+    SetBkMode(hdc, TRANSPARENT);
+    for (int i = 0; i < n; ++i) {
+        RECT item_rc;
+        if (!SendMessageW(header, HDM_GETITEMRECT, (WPARAM)i, (LPARAM)&item_rc)) {
+            continue;
+        }
+        LVCOLUMNW column;
+        ZeroMemory(&column, sizeof(column));
+        column.mask = LVCF_TEXT;
+        wchar_t title[64];
+        ZeroMemory(title, sizeof(title));
+        column.pszText = title;
+        column.cchTextMax = (int)(sizeof(title) / sizeof(title[0]) - 1);
+        ListView_GetColumn(ls->list, i, &column);
+        RECT tr = item_rc;
+        tr.left += ui_px(10);
+        tr.right -= ui_px(6);
+        DrawTextW(hdc, title, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(hdc, old_font);
 }
 
 static LRESULT CALLBACK header_proc(HWND hwnd, UINT msg, WPARAM wparam,
                                     LPARAM lparam)
 {
-    UiListState *ls = (UiListState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    UiTheme *t = &g_theme;
+    /* The header's GWLP_USERDATA belongs to comctl32 (internal state
+     * pointer), so the list state is looked up by the header window
+     * handle instead. */
+    UiListState *ls = ui_list_find_by_header(hwnd);
 
     switch (msg) {
     case WM_ERASEBKGND:
         return 1;
+    case WM_PAINT:
     case WM_NCPAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, t->panel_brush);
+        if (ls) {
+            ui_draw_header(hwnd, ls, hdc);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1525,32 +1545,52 @@ static LRESULT CALLBACK header_proc(HWND hwnd, UINT msg, WPARAM wparam,
 void ui_dark_listview(HWND list, unsigned numeric_mask, UiListTextFn text_fn,
                       void *ctx)
 {
-    if (g_list_count >= UI_LIST_MAX) {
+    int slot = -1;
+    for (int i = 0; i < UI_LIST_MAX; ++i) {
+        if (!g_lists[i].list || !IsWindow(g_lists[i].list)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0 && g_list_count < UI_LIST_MAX) {
+        slot = g_list_count;
+    }
+    if (slot < 0) {
         return;
     }
-    UiListState *ls = &g_lists[g_list_count];
+    UiListState *ls = &g_lists[slot];
     ls->list = list;
     ls->header = FindWindowExW(list, NULL, L"SysHeader32", NULL);
     ls->numeric_mask = numeric_mask;
     ls->text_fn = text_fn;
     ls->ctx = ctx;
-    ls->old_list_proc = NULL;
     ls->old_header_proc = NULL;
 
     ListView_SetExtendedListViewStyle(list, LVS_EX_DOUBLEBUFFER);
 
-    WNDPROC old = (WNDPROC)GetWindowLongPtrW(list, GWLP_WNDPROC);
-    SetWindowLongPtrW(list, GWLP_WNDPROC, (LONG_PTR)listview_proc);
-    ls->old_list_proc = (LRESULT (CALLBACK *)(HWND, UINT, WPARAM, LPARAM))old;
-    SetWindowLongPtrW(list, GWLP_USERDATA, (LONG_PTR)ls);
+    /* Paint the area not covered by rows (below the last row, right of the last
+     * column) with the ink color instead of the default light system color. */
+    ListView_SetBkColor(list, ui_theme()->ink);
 
+    /*
+     * Neither the list view nor its header may have their WNDPROC or
+     * GWLP_USERDATA fields disturbed by us in a way comctl32 does not
+     * expect: comctl32 keeps its own internal state pointers in the
+     * GWLP_USERDATA of both windows, and every LVM_* message must reach
+     * the original comctl32 window procedure. The list view is therefore
+     * not subclassed at all; rows and cells are drawn through the
+     * parent panel's NM_CUSTOMDRAW handling and the row background comes
+     * from WM_CTLCOLORLISTVIEW. Only the header is subclassed, and its
+     * original procedure is chained to, so it can be drawn dark.
+     */
     if (ls->header) {
         WNDPROC old_header =
             (WNDPROC)GetWindowLongPtrW(ls->header, GWLP_WNDPROC);
         SetWindowLongPtrW(ls->header, GWLP_WNDPROC, (LONG_PTR)header_proc);
         ls->old_header_proc =
             (LRESULT (CALLBACK *)(HWND, UINT, WPARAM, LPARAM))old_header;
-        SetWindowLongPtrW(ls->header, GWLP_USERDATA, (LONG_PTR)ls);
     }
-    ++g_list_count;
+    if (g_list_count < UI_LIST_MAX) {
+        ++g_list_count;
+    }
 }

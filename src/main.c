@@ -1946,7 +1946,7 @@ static void create_overview_controls(AppState *app, HWND hwnd)
 
     app->overview_fan_list = CreateWindowExW(
         0, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
             LVS_NOSORTHEADER,
         12, 34, 976, 360, app->overview_fans_panel, NULL, GetModuleHandleW(NULL),
         NULL);
@@ -1971,7 +1971,7 @@ static void create_overview_controls(AppState *app, HWND hwnd)
 
     app->overview_sensor_list = CreateWindowExW(
         0, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
             LVS_NOSORTHEADER,
         12, 34, 976, 120, app->overview_sensor_panel, NULL,
         GetModuleHandleW(NULL), NULL);
