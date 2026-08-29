@@ -1209,14 +1209,13 @@ static void update_gpu_stats_view(AppState *app)
         case 6:
             if (s->have_throttle) {
                 unsigned long long t = s->throttle_status;
-                if (t & (NVML_THROTTLE_HW_THERMAL | NVML_THROTTLE_SW_THERMAL)) {
+                if (t & (NVML_EVENT_HW_THERMAL_SLOWDOWN | NVML_EVENT_SW_THERMAL_SLOWDOWN)) {
                     copy_wstr(text, sizeof(text) / sizeof(text[0]), L"THERMAL");
-                } else if (t & (NVML_THROTTLE_HW_POWER_BRAKE |
-                                 NVML_THROTTLE_SW_POWER_BRAKE)) {
+                } else if (t & (NVML_EVENT_HW_POWER_BRAKE | NVML_EVENT_HW_SLOWDOWN)) {
                     copy_wstr(text, sizeof(text) / sizeof(text[0]), L"PWR BRAKE");
-                } else if (t & NVML_THROTTLE_SW_POWER_CAP) {
+                } else if (t & NVML_EVENT_SW_POWER_CAP) {
                     copy_wstr(text, sizeof(text) / sizeof(text[0]), L"PWR LIMIT");
-                } else if (t & NVML_THROTTLE_GPU_IDLE) {
+                } else if (t & NVML_EVENT_GPU_IDLE) {
                     copy_wstr(text, sizeof(text) / sizeof(text[0]), L"IDLE");
                 } else if (t == 0) {
                     copy_wstr(text, sizeof(text) / sizeof(text[0]), L"NONE");
@@ -2720,8 +2719,7 @@ static void layout_main(AppState *app)
                TRUE);
     MoveWindow(app->gpu_readout, w - m - readout_w, ui_px(26), readout_w, ui_px(34),
                TRUE);
-    MoveWindow(app->status_dot, w - m - readout_w - ui_px(22), ui_px(44), ui_px(12),
-               ui_px(12), TRUE);
+    MoveWindow(app->status_dot, 0, 0, 0, 0, FALSE);
 
     /* Body. */
     int body_top = ui_px(74);

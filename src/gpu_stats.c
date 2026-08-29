@@ -95,7 +95,7 @@ static bool nvml_ensure(char *err, size_t err_len)
     g_nvml.get_power_limit = (NvmlDeviceGetPowerLimitFn)GetProcAddress(
         dll, "nvmlDeviceGetPowerManagementLimit");
     g_nvml.get_throttle = (NvmlDeviceGetThrottleStatusFn)GetProcAddress(
-        dll, "nvmlDeviceGetCurrentClocksThrottleReasons");
+        dll, "nvmlDeviceGetCurrentClocksEventReasons");
 
     if (!g_nvml.init || !g_nvml.shutdown || !g_nvml.get_handle) {
         set_error(err, err_len, "Required NVML functions are missing from nvml.dll.");

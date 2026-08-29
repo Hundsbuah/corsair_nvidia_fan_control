@@ -3,14 +3,17 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* NVML throttle-status bit reasons (subset of nvml.h). Used to identify
- * which active constraint is limiting the GPU's clocks right now. */
-#define NVML_THROTTLE_GPU_IDLE        0x0000000000000001ULL
-#define NVML_THROTTLE_SW_POWER_CAP    0x0000000000000002ULL
-#define NVML_THROTTLE_HW_THERMAL      0x0000000000000004ULL
-#define NVML_THROTTLE_HW_POWER_BRAKE  0x0000000000000008ULL
-#define NVML_THROTTLE_SW_THERMAL      0x0000000000000010ULL
-#define NVML_THROTTLE_SW_POWER_BRAKE  0x0000000000000200ULL
+/* NVML clocks-event-reason bits (nvmlDeviceGetCurrentClocksEventReasons).
+ * Identifies which active constraint is limiting the GPU's clocks. */
+#define NVML_EVENT_GPU_IDLE             0x0000000000000001ULL
+#define NVML_EVENT_APPS_CLOCKS          0x0000000000000002ULL
+#define NVML_EVENT_SW_POWER_CAP         0x0000000000000004ULL
+#define NVML_EVENT_HW_SLOWDOWN          0x0000000000000008ULL
+#define NVML_EVENT_SYNC_BOOST           0x0000000000000010ULL
+#define NVML_EVENT_SW_THERMAL_SLOWDOWN  0x0000000000000020ULL
+#define NVML_EVENT_HW_THERMAL_SLOWDOWN  0x0000000000000040ULL
+#define NVML_EVENT_HW_POWER_BRAKE       0x0000000000000080ULL
+#define NVML_EVENT_DISPLAY_CLOCK        0x0000000000000100ULL
 
 /* Live GPU telemetry from NVML (the API behind nvidia-smi). NVML is loaded
  * dynamically from nvml.dll, mirroring the dynamic NVAPI load in
