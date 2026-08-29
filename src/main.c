@@ -39,7 +39,7 @@
 #define REFRESH_TIMER 1
 #define TRAY_RETRY_TIMER 2
 /* GPU telemetry readout rows (index order = row order in the panel). */
-#define STAT_ROW_COUNT 6
+#define STAT_ROW_COUNT 7
 /* Update (poll) interval: adjustable between UPDATE_MIN_MS and UPDATE_MAX_MS.
  * A slider maps position 0 (slowest, max ms) .. 100 (fastest, min ms). */
 #define UPDATE_MIN_MS 500
@@ -1198,13 +1198,36 @@ static void update_gpu_stats_view(AppState *app)
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
-        default:
+        case 5:
             if (s->have_limit) {
                 swprintf(text, sizeof(text) / sizeof(text[0]), L"%d W",
                          s->power_limit_mw / 1000);
             } else {
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
+            break;
+        case 6:
+            if (s->have_throttle) {
+                unsigned long long t = s->throttle_status;
+                if (t & (NVML_THROTTLE_HW_THERMAL | NVML_THROTTLE_SW_THERMAL)) {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"THERMAL");
+                } else if (t & (NVML_THROTTLE_HW_POWER_BRAKE |
+                                 NVML_THROTTLE_SW_POWER_BRAKE)) {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"PWR BRAKE");
+                } else if (t & NVML_THROTTLE_SW_POWER_CAP) {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"PWR LIMIT");
+                } else if (t & NVML_THROTTLE_GPU_IDLE) {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"IDLE");
+                } else if (t == 0) {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"NONE");
+                } else {
+                    copy_wstr(text, sizeof(text) / sizeof(text[0]), L"ACTIVE");
+                }
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        default:
             break;
         }
         SetWindowTextW(app->stat_values[i], text);
@@ -2603,7 +2626,7 @@ static void create_main_controls(AppState *app, HWND hwnd)
 
     static const wchar_t *stat_names[STAT_ROW_COUNT] = {
         L"GPU Clock", L"Memory Clock", L"Voltage", L"Fan Speed",
-        L"Board Power", L"Power Limit"
+        L"Board Power", L"Power Limit", L"Throttle"
     };
     for (int i = 0; i < STAT_ROW_COUNT; ++i) {
         app->stat_labels[i] = make_child(hwnd, WC_STATICW, stat_names[i], SS_LEFT,
@@ -2834,13 +2857,13 @@ static void layout_main(AppState *app)
     MoveWindow(app->save_btn, x_r + ui_px(12), options_top + opts_h - ui_px(38),
                right_w - ui_px(24), ui_px(28), TRUE);
 
-    /* Telemetry column. Six readout rows plus the power meter are spread
-     * evenly across the body height (seven slots); the meter owns slot 5,
-     * so the Power Limit row is the last one. */
+    /* Telemetry column. Seven readout rows plus the power meter are spread
+     * evenly across the body height (eight slots); the meter owns slot 5,
+     * so the Throttle row is the last one. */
     MoveWindow(app->stats_panel, x_s, body_top, stats_w, body_h, TRUE);
     MoveWindow(app->stats_heading, x_s + ui_px(12), body_top + ui_px(10),
                ui_px(160), ui_px(16), TRUE);
-    int stat_slots = 7;
+    int stat_slots = 8;
     int stat_area_top = body_top + ui_px(52);
     int stat_area_bottom = body_bottom - ui_px(12);
     int stat_pitch = (stat_area_bottom - stat_area_top) / stat_slots;
@@ -2848,7 +2871,7 @@ static void layout_main(AppState *app)
         stat_pitch = ui_px(22);
     }
     for (int i = 0; i < STAT_ROW_COUNT; ++i) {
-        int slot = (i < 5) ? i : 6;
+        int slot = (i < 5) ? i : (i + 1);
         int y = stat_area_top + slot * stat_pitch + (stat_pitch - ui_px(16)) / 2;
         MoveWindow(app->stat_labels[i], x_s + ui_px(12), y, ui_px(104), ui_px(16),
                    TRUE);

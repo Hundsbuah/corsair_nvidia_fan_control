@@ -28,6 +28,8 @@ typedef nvmlReturn(*NvmlDeviceGetClockFn)(nvmlDevice_t device, unsigned int cloc
 typedef nvmlReturn(*NvmlDeviceGetFanSpeedFn)(nvmlDevice_t device, unsigned int *speed);
 typedef nvmlReturn(*NvmlDeviceGetPowerUsageFn)(nvmlDevice_t device, unsigned int *power_mw);
 typedef nvmlReturn(*NvmlDeviceGetPowerLimitFn)(nvmlDevice_t device, unsigned int *limit_mw);
+typedef nvmlReturn(*NvmlDeviceGetThrottleStatusFn)(nvmlDevice_t device,
+                                                    unsigned long long *status);
 
 static void set_error(char *err, size_t err_len, const char *fmt, ...)
 {
@@ -54,6 +56,7 @@ static struct {
     NvmlDeviceGetFanSpeedFn get_fan;
     NvmlDeviceGetPowerUsageFn get_power;
     NvmlDeviceGetPowerLimitFn get_power_limit;
+    NvmlDeviceGetThrottleStatusFn get_throttle;
     nvmlDevice_t device;
     bool ready;
 } g_nvml;
@@ -91,6 +94,8 @@ static bool nvml_ensure(char *err, size_t err_len)
     g_nvml.get_power = (NvmlDeviceGetPowerUsageFn)GetProcAddress(dll, "nvmlDeviceGetPowerUsage");
     g_nvml.get_power_limit = (NvmlDeviceGetPowerLimitFn)GetProcAddress(
         dll, "nvmlDeviceGetPowerManagementLimit");
+    g_nvml.get_throttle = (NvmlDeviceGetThrottleStatusFn)GetProcAddress(
+        dll, "nvmlDeviceGetCurrentClocksThrottleReasons");
 
     if (!g_nvml.init || !g_nvml.shutdown || !g_nvml.get_handle) {
         set_error(err, err_len, "Required NVML functions are missing from nvml.dll.");
@@ -167,6 +172,14 @@ bool gpu_stats_read(GpuStats *stats)
         if (session_rc == NVML_SUCCESS) {
             stats->power_limit_mw = (int)value;
             stats->have_limit = true;
+        }
+    }
+    if (g_nvml.get_throttle) {
+        unsigned long long status = 0;
+        session_rc = g_nvml.get_throttle(g_nvml.device, &status);
+        if (session_rc == NVML_SUCCESS) {
+            stats->throttle_status = status;
+            stats->have_throttle = true;
         }
     }
 
