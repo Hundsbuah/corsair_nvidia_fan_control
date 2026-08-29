@@ -73,7 +73,9 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 3. Click `Scan` if needed. All detected controllers are opened and initialized;
    the device selection only chooses which controller is displayed and edited.
 4. Click `Overview` to see the cached live values from every controller in one
-   resizable window. The tables update with the five-second background poll.
+   resizable window. The tables repaint with the five-second background poll;
+   hardware values themselves refresh every second refresh tick (~10 seconds,
+   see below).
 5. Move a fan slider and click the row's `Apply`, or use `Apply all`.
 6. For GPU-based control, select `NVIDIA` in a fan's mode box. The curve is
    edited directly on the `GPU CURVE` graph, where both temperature and fan
@@ -92,8 +94,12 @@ temperature when `nvapi64.dll` is available from the installed NVIDIA driver.
 The Commander Pro stores hardware-side fan settings, so fixed values can keep
 running after the GUI exits. Reinitialize after boot, resume or USB reconnect.
 The `NVIDIA` curve is software-driven and only updates while this tool is
-running. GPU temperature polling and curve updates run every 5 seconds for all
-detected controllers, independently of the controller selected in the GUI.
+running. The background poll fires every 5 seconds and repaints the UI with
+the latest values; GPU temperature polling also runs every 5 seconds. HID
+sensor reads and NVIDIA curve updates are rate-limited to every second
+refresh tick (~10 seconds) for all detected controllers, independently of the
+controller selected in the GUI, to halve the worst-case HID I/O on the UI
+thread.
 The GUI saves the selected controller and GPU curve points under
 `HKCU\Software\CorsairNvidiaFanControl`; fan mode selections, fixed duty values
 and fan auto-apply flags are stored per physical controller under

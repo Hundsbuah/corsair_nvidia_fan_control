@@ -295,6 +295,16 @@ static bool response_success(unsigned char code, char *err, size_t err_len)
     }
 }
 
+/* 0x11 (no data) and 0x12 (channel not fixed-duty controlled) are expected
+ * per-channel conditions in the kernel driver (-ENODATA), not fatal errors.
+ * send_command() copies the device response into the caller's buffer before
+ * evaluating response_success(), so callers that zero their buffer before
+ * the call can inspect it after a failed call. */
+static bool response_no_data(unsigned char code)
+{
+    return code == 0x11 || code == 0x12;
+}
+
 static bool send_command(CorsairDevice *dev, unsigned char command,
                          const unsigned char *data, size_t data_len,
                          unsigned char response[RESPONSE_LEN],
@@ -504,9 +514,15 @@ bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
         dev->status.temp_c[i] = 0.0;
         if (dev->status.temp_connected[i]) {
             unsigned char data[1] = { (unsigned char)i };
+            ZeroMemory(res, sizeof(res));
             if (!send_command(dev, CMD_GET_TEMP, data, sizeof(data), res,
                               MUTEX_READ_TIMEOUT_MS, err, err_len)) {
-                return false;
+                if (!response_no_data(res[0])) {
+                    return false;
+                }
+                /* Expected no-data: treat the probe as not connected. */
+                dev->status.temp_connected[i] = false;
+                continue;
             }
             dev->status.temp_c[i] = (double)(int16_t)u16_be(res, 1) / 100.0;
         }
@@ -517,19 +533,31 @@ bool corsair_refresh(CorsairDevice *dev, char *err, size_t err_len)
         if (dev->status.fan_mode[i] == CORSAIR_FAN_DC ||
             dev->status.fan_mode[i] == CORSAIR_FAN_PWM) {
             unsigned char data[1] = { (unsigned char)i };
+            ZeroMemory(res, sizeof(res));
             if (!send_command(dev, CMD_GET_FAN_RPM, data, sizeof(data), res,
                               MUTEX_READ_TIMEOUT_MS, err, err_len)) {
-                return false;
+                if (!response_no_data(res[0])) {
+                    return false;
+                }
+                /* Expected no-data: treat the fan as not connected. */
+                dev->status.fan_mode[i] = CORSAIR_FAN_DISCONNECTED;
+                continue;
             }
             dev->status.fan_rpm[i] = u16_be(res, 1);
         }
     }
 
     for (int i = 0; i < CORSAIR_VOLT_COUNT; ++i) {
+        dev->status.volts[i] = 0.0;
         unsigned char data[1] = { (unsigned char)i };
+        ZeroMemory(res, sizeof(res));
         if (!send_command(dev, CMD_GET_VOLTS, data, sizeof(data), res,
                           MUTEX_READ_TIMEOUT_MS, err, err_len)) {
-            return false;
+            if (!response_no_data(res[0])) {
+                return false;
+            }
+            /* Expected no-data: keep the channel at 0 V. */
+            continue;
         }
         dev->status.volts[i] = (double)u16_be(res, 1) / 1000.0;
     }

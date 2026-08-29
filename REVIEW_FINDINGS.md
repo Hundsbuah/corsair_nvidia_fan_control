@@ -548,3 +548,149 @@ Verifizierung** (Signatur-/Contract-Prüfung), kein Live-Lauf.
   neues `serial`-Feld bricht nichts (`cli_probe.c`/`main.c` nutzen uninitialisierte Arrays).
 - `swprintf` mit C99-Count-Semantik (UCRT) ist konsistent mit Bestand; Puffer `ident[160]`
   overflow-sicher (Serial ≤63 Chars).
+
+---
+
+## Dritte unabhängige Review-Runde (2026-08-29) — Findings für die nächste KI
+
+**Zweck:** Maschinell verwertbare Anweisungen für Runde 3. Findings in dieser Reihenfolge fixen
+(F-001 → F-002 → F-003 → F-004). Pro Fix: 1) umsetzen, 2) verifizieren, 3) `STATUS:` auf `FIXED`
+setzen. Abschnitt A (EXTERN WIDERLEGT) **nicht** fixen.
+
+**Metadaten**
+- Geprüft bei Commit: `9a1f0a9` (main). Zeilennummern beziehen sich auf `9a1f0a9` — vor jedem Fix
+  neu auflösen (per Funktionsname suchen, nicht blind per Zeile).
+- Methodik: Vollstatische Analyse + **verpflichtende externe Gegenrecherche** gegen Primärquellen
+  (offizielle NVIDIA `nvapi.h`/`nvapi_lite_common.h`, Linux-`corsair-cpro.c`, liquidctl
+  `commander_pro.py`, MS-Doku). Graphify-first lt. AGENTS.md. Clean-Build clang-cl `/W4`
+  (0 Warnings, Link OK).
+- **Kernergebnis: KEINE neuen CRITICAL-/HIGH-Defekte.** NVAPI- und HID-Schicht extern
+  verifiziert korrekt. Alle Findings unten = LOW (latent/Robustheit/Doku).
+
+### A. EXTERN WIDERLEGT — NICHT fixen (Falsch-Positive-Gate)
+
+**A-001: NVAPI-Thermal-Target-Konstanten sind KORREKT (kein Bug).**
+- `nvidia_temp.c:12/13/36`: `NVAPI_THERMAL_TARGET_GPU 1`, `NVAPI_THERMAL_TARGET_ALL 15`,
+  `NvThermalTarget { NONE=0, MEMORY=2, POWER_SUPPLY=4, BOARD=8, UNKNOWN=-1 }`.
+- Offizielle `nvapi.h` (EXT-001) definiert exakt: `GPU=1, MEMORY=2, POWER_SUPPLY=4, BOARD=8,
+  ALL=15`. → Code stimmt überein.
+- Ebenfalls korrekt: `NVAPI_MAX_THERMAL_SENSORS_PER_GPU=3`, `NvGpuThermalSettings` =
+  `NV_GPU_THERMAL_SETTINGS_V2` (`NvS32`-Felder), `MAKE_NVAPI_VERSION` (EXT-001/002), alle 6
+  Interface-IDs (EXT-003), `sensorIndex = NVAPI_THERMAL_TARGET_ALL`-Semantik (EXT-001).
+- **Wichtig:** Wer hier „GPU sollte 8 sein“ / „ALL sollte 0xFF sein“ vermutet, irrt — die
+  Primärquelle widerlegt es. NICHT ändern.
+
+### B. Neue Findings (OPEN)
+
+#### F-001: Per-Device-Settings-Key — Fallback-Hash ist konstant (Kollision)
+- **Severity:** LOW (latent) | **Confidence:** HIGH (Logik) / reale Auswirkung LOW
+- **Kategorie:** Correctness (Settings-Persistenz)
+- **STATUS:** FIXED
+- **Fix (Commit-Stand nach 9a1f0a9):** Fallback in `device_settings_key` (src/main.c) hashet jetzt `hw:VID:PID:<Pfadpräfix vor erstem '#'>` (z. B. `hw:1B1C:0C10:\\?\\HID`) statt nur des konstanten Präfixes `\\?\\HID` (identisch für alle HID-Geräte). Primärer Serial-Pfad (`usb:VID:PID:serial`) unverändert. Rest-Limitation (zwei identische, serienlose Geräte mit gleichem VID/PID) in Code-Kommentar dokumentiert.
+- **Verifikation:** `temp/verify_f001.c` (Funktion verbatim aus src/main.c extrahiert nach `temp/f001_func.inc`, dadurch keine Copy-Divergenz): 9/9 PASS — Serial-Pfad deterministisch/distinkt (unverändert); Fallback mit unterschiedlichem PID oder VID (ohne Serial) → verschiedene Keys (früher Kollision); identisches VID/PID ohne Serial → gleicher Key (dokumentierte Limitation); NULL/leerer Input ohne Crash. Regression: `git diff` belegt, dass der Primärpfad byte-identisch bleibt. Clean-Build clang-cl `/W4`: 0 Warnings.
+- **Betroffene Datei:** `src/main.c` (`device_settings_key`, ~Zeile 415–445; Fallback-Loop ~430)
+- **Problem:** Fallback-Branch (nur wenn `info->serial[0]` leer) bildet den Hash über „alles vor
+  dem ersten `#`“ des Device-Pfads. Für `\\?\\HID#VID_1B1C&PID_0C10#<instance>#{<guid>}` ist das
+  nur die konstante Präfix `\\?\\HID` (EXT-006) → **identisch für alle HID-Geräte**. Der Comment
+  verspricht „stabilen Hardware-Präfix, der nur den Instance-ID-Anteil ausschließt“ (VID/PID
+  beibehalten) — die Implementierung schließt VID/PID mit ein.
+- **Folge:** Meldet ein Gerät **keine** USB-Seriennummer und es sind **mehrere** Controller
+  verbunden → alle bekommen Key `hash("\\?\\HID")` → per-Gerät-Settings kollidieren/überschreiben.
+- **Warum LOW:** Commander Pro meldet iSerial (EXT-007: `iSerial 128 0905031174181010`) →
+  primärer `usb:VID:PID:serial`-Key wird praktisch immer genutzt → Kollision nur im Edge-Fall
+  (serienlos + Multi-Device). Auslöser unwahrscheinlich.
+- **Fix-Anleitung:** Fallback um die immer verfügbaren `vendor_id`/`product_id` ergänzen, z. B.
+  ident = `hw:%04X:%04X:%s` (VID:PID + Präfix vor erstem `#`). Optional dokumentieren: ohne
+  Seriennummer können zwei identische Geräte kollidieren. Den (korrekten) primären
+  Seriennummer-Pfad **nicht** anfassen.
+- **Verifikation:** Statisch: Fallback-String enthält jetzt VID/PID (nicht mehr nur `\\?\\HID`).
+  Simulation: zwei Geräte ohne Seriennummer → verschiedene Keys. Regression: serielle Geräte →
+  Key unverändert (`usb:VID:PID:serial`).
+
+#### F-002: `corsair_refresh` behandelt „no data“ (0x11/0x12) als fatal
+- **Severity:** LOW (Robustheit) | **Confidence:** HIGH
+- **Kategorie:** Reliability
+- **STATUS:** FIXED
+- **Fix (Commit-Stand nach 9a1f0a9):** `corsair_refresh` (src/corsair_hid.c) behandelt `0x11`/`0x12` pro Kanal als „Kanal überspringen“: Temp → `temp_connected[i]=false` + Wert 0.0, Fan → `fan_mode[i]=CORSAIR_FAN_DISCONNECTED` + 0 RPM, Volt → 0.0 V — statt `return false` (Close + Re-Initialize-Zyklus). Neuer Helper `response_no_data(code)`. `send_command` kopiert die Device-Antwort in den Caller-Puffer, *bevor* `response_success` evaluiert wird; mit vor jedem Aufruf zerlegttem `res` lässt sich so erwarteter No-Data von echten I/O-Fehlern unterscheiden. Echte Fehler (0x01/0x10/unknown, I/O-Fehler) scheitern weiterhin. Config-/Fan-Mode-Reads am Refresh-Beginn bleiben unverändert (nicht kanalspezifisch).
+- **Verifikation:** `temp/verify_f002.c` — das echte `src/corsair_hid.c` mit `WriteFile`/`ReadFile` auf ein programmiertes Device-Modell umgelenkt (Stub-Transport, keine Hardware, `corsair_open` nicht involviert): 20/20 PASS — Baseline gesundes Gerät (Regression); 0x11 auf Temp-Kanal → Refresh grün, Kanal als disconnected markiert, andere Kanäle unverändert; 0x12 auf Fan-Kanal → Refresh grün, Fan disconnected; 0x11 auf Volt-Kanal → 0.0 V, Refresh grün; Regressionen: 0x10, unknown 0x7F, I/O-Write-Fehler → `corsair_refresh` scheitert weiterhin.
+- **Betroffene Dateien:** `src/corsair_hid.c` (`response_success`, `corsair_refresh`),
+  `src/main.c` (~1551, `close_controller` bei Refresh-Fehler)
+- **Problem:** `response_success` liefert für `0x11`/`0x12` `false`. In `corsair_refresh` führt
+  **ein** solcher Response auf einem verbundenen Kanal zu `return false` → `refresh_status` macht
+  `close_controller` + `refresh_failed` + Retry alle `REFRESH_FAIL_RETRY_EVERY` Ticks. Laut
+  Kernel-Treiber sind `0x11`/`0x12` aber **erwartete** `-ENODATA`-Zustände (EXT-004), keine
+  echten Fehler.
+- **Folge:** Transienter „no data“ auf einem Kanal → teurer Close + vollständiger
+  Re-`corsair_initialize`-Zyklus. Selten (Temp-Config zu Refresh-Beginn frisch), self-healing.
+- **Fix-Anleitung:** In `corsair_refresh` `0x11`/`0x12` pro Kanal als „diesen Kanal überspringen
+  (Wert 0 / nicht verbunden)“ behandeln statt den gesamten Refresh zu scheitern. Ggf.
+  `response_success` um einen „expected no-data“-Zustand ergänzen und in `corsair_refresh`
+  gezielt dafür abfragen.
+- **Verifikation:** Statisch + (falls möglich) Test-/Fake-Gerät, das für einen Kanal `0x11`
+  liefert: Refresh bleibt grün, kein Close/Reopen. Regression: normales Gerät unverändert.
+
+#### F-003: Stale GDI-Brush im Window-Class nach `ui_set_dpi` (bestätigt U-005)
+- **Severity:** LOW (DPI-Wechsel-getriggert) | **Confidence:** MEDIUM
+- **Kategorie:** Correctness / GDI-Lifetime
+- **STATUS:** FIXED
+- **Fix (Commit-Stand nach 9a1f0a9, Option (b) lt. Finding):** `wc.hbrBackground = NULL` für beide Klassen (Main + Overview); `wnd_proc` und `overview_wnd_proc` behandeln `WM_ERASEBKGND` selbst per `FillRect` mit dem *aktuellen* `ui_theme()->ink_brush` → die Klassen halten keinerlei GDI-Handle mehr, ein Stale-Handle nach `ui_set_dpi` ist damit strukturell ausgeschlossen. (Option (a) verworfen: Sonderfall in der geteilten Asset-Verwaltung von ui.c; (b) ist lokal auf main.c begrenzt.)
+- **Verifikation:** `temp/verify_f003.py` (Clean-Build `build-clang`, echtes Gerät): Hauptfenster gefunden, Baseline-Margen ink RGB(20,23,28); 6 simulierte Cross-DPI-Zyklen (synthetische `WM_DPICHANGED` 144→96→120→96→144→96, jeder Zählerläuft das echte `ui_set_dpi` → Brush-Delete/Recreate) → Margen bleiben ink, Fenster durchgängig alive; danach +80-px-Resize exponiert neue Fläche → Bottom-Strip ink, gestreckte Panel-Fläche gemalt (nicht schwarz/unpainted). **A/B-Negativ-Kontrolle:** Pre-Fix-Build aus `git archive 9a1f0a9` (`temp/f003pre`) ist auf dieser Maschine optisch identisch — GDI-Handle-Reuse kaschiert den Stale-Class-Brush (wie das Finding selbst einordnet: „sichtbare Auswirkung vom GDI-Handle-Reuse-Verhalten abhängig“); der Fix eliminiert die Abhängigkeit komplett (statischer Nachweis: Klasse hält kein Handle). WinDbg-`!handle`-Nachweis nicht durchgeführt (WinDbg in dieser Umgebung nicht verfügbar).
+- **Betroffene Dateien:** `src/main.c` (~2888, `wc.hbrBackground = t->ink_brush`), `src/ui.c`
+  (`ui_rebuild_dpi_assets`, `ui_release_brushes`)
+- **Problem:** `RegisterClassW` kopiert den alten `t->ink_brush`-Handle-Wert in
+  `wndclass.hbrBackground`. `ui_set_dpi` → `ui_release_brushes` **löscht** ihn und ersetzt ihn.
+  Haupt- + Overview-Fenster behandeln `WM_ERASEBKGND`/`WM_PAINT` **nicht** selbst (nur
+  Custom-Controls/Panels) → DefWindowProc nutzt nach DPI-Wechsel den stale/gelöschten Class-Brush.
+- **Folge:** Nur bei cross-Monitor `WM_DPICHANGED`; sichtbare Fläche klein (Child-Controls decken
+  ab). Mglw. falsche/fehlende Hintergrund-Bürstung.
+- **Fix-Anleitung (eine von zwei):**
+  (a) Class-Brush nie löschen/ersetzen — neu anlegen nur wenn sich der Farb-Wert ändert; oder
+  (b) `wc.hbrBackground = NULL` (und `overview_wc` gleich) setzen + Erase vollständig in
+  `WM_ERASEBKGND`/`WM_PAINT` der Haupt-/Overview-Fenster übernehmen.
+- **Verifikation:** Multi-Monitor-DPI-Test (100 % → 150 %): Hauptfenster-Hintergrund korrekt
+  (keine Artefakte/stale-Handle); GDI-Handle-Logging oder WinDbg `!handle` als Nachweis.
+
+#### F-004: M-003-Rate-Limiting halbiert auch den NVIDIA-Kurven-Takt (Doku)
+- **Severity:** INFO | **Confidence:** HIGH
+- **Kategorie:** Documentation
+- **STATUS:** FIXED
+- **Fix (Commit-Stand nach 9a1f0a9):** README („Use“ Schritt 4 + „Notes“-Absatz) dokumentiert jetzt: 5 s = UI-Repaint/Overview + GPU-Temperatur-Polling; HID-Sensor-Reads + NVIDIA-Kurven-Apply sind auf jeden zweiten Refresh-Tick (~10 s) rate-limitiert (bewusste M-003-Mitigation). Keine Code-Änderung.
+- **Verifikation:** Statisch: README-Text konsistent mit `POLL_INTERVAL_MS` (5000) und `REFRESH_EVERY_TICKS` (2) in src/main.c; `refresh_gpu_status` läuft pro Tick (unbedingt), `corsair_refresh` + `apply_nvidia_curve_to_controller` hinter dem `REFRESH_EVERY_TICKS`-`continue`.
+- **Betroffene Dateien:** `README.md` („Use“/„Notes“), `src/main.c` (`refresh_status`,
+  `REFRESH_EVERY_TICKS`)
+- **Problem:** Die Rate-Limit-`continue` überspringt die gesamte Iteration inkl.
+  `apply_nvidia_curve_to_controller`. Für echte Geräte laufen HID-Reads **und** Kurven-Apply
+  alle 2 Ticks (~10 s), nicht 5 s. README sagt „five-second background poll“ / „curve updates
+  run every 5 seconds“.
+- **Fix-Anleitung:** README anpassen: 5 s = UI-Redraw/Overview; ~10 s = echte HID-Reads +
+  NVIDIA-Kurven-Apply (bewusste M-003-Mitigation). Keine Code-Änderung nötig.
+- **Verifikation:** README-Text konsistent mit `REFRESH_EVERY_TICKS` (=2) in `src/main.c`.
+
+### C. Bewusst NICHT fixen / Unverified (wie Runde 1/2)
+- **U-001** (stale manual-reset `OVERLAPPED`-Event nach `CancelIoEx`): schmaler, self-healing
+  Race. Fix-Richtung lt. MS-Empfehlung: `HasOverlappedIoCompleteProcessing` vor
+  `GetOverlappedResult(FALSE)`, oder `ResetEvent` erst NACH `GetOverlappedResult`, oder Event
+  pro Transaktion. Erst nach Hardware-Test mit erzwungenen Timeouts + Event-Zustands-Log.
+- **U-003** (0xFFFF → −0.01 °C): passt exakt zum Kernel-Verhalten (`(s16)0xFFFF`). Nur bei
+  Status `0x00` + Wert `0xFFFF` auf verbundener Kanal. Gerätespezifisch, nicht blind fixen.
+- **U-004** (Global\ vs. Session-Mutex): nur gemischte Privilegienlage; `WAIT_ABANDONED`+Drain
+  mildern. Kein Defekt in dokumentierter Nutzung.
+
+### D. Positive Beobachtungen (extern bestätigt, NICHT ändern)
+- Puffer-/Ressourcen-Hygiene durchgängig overflow-sicher; Clean-Build `/W4` ohne Warnings.
+- Curve-Editor-Invarianten by construction (keine Division/0).
+- Defensive Settings-Handhabung (Range-/Typ-Checks; Duty 0–100; Modes aus festem Enum).
+- Sichere DLL-Load (`LOAD_LIBRARY_SEARCH_SYSTEM32` zuerst); NVAPI-Interface-/Struktur-Layout
+  exakt mit offizieller Definition identisch.
+- Vollständiges Cleanup; `corsair_close` idempotent; pro-Controller-Fehlerisolierung.
+
+### E. Externe Referenzen (Runde 3)
+| ID | Quelle | Typ | Relevant für |
+|---|---|---|---|
+| EXT-001 | https://raw.githubusercontent.com/NVIDIA/nvapi/master/nvapi.h | Primär (offiziell) | A-001 (Thermal-Target, Struktur, ALL) |
+| EXT-002 | https://raw.githubusercontent.com/NVIDIA/nvapi/master/nvapi_lite_common.h | Primär (offiziell) | A-001 (MAKE_NVAPI_VERSION, MAX_GPUS) |
+| EXT-003 | https://github.com/falahati/NvAPIWrapper/blob/master/NvAPIWrapper/Native/Helpers/FunctionId.cs | Referenz | A-001 (6 Interface-IDs) |
+| EXT-004 | https://raw.githubusercontent.com/torvalds/linux/master/drivers/hwmon/corsair-cpro.c | Primär (Kernel) | HID: IDs, Endian, Status-Bytes, 0x11/0x12=ENODATA |
+| EXT-005 | https://raw.githubusercontent.com/liquidctl/liquidctl/main/liquidctl/driver/commander_pro.py | Referenz (Primär) | HID: IDs, u16be, Report-Layout, Fan-Mode |
+| EXT-006 | https://learn.microsoft.com/en-us/windows-hardware/drivers/install/device-instance-ids | Offiziell (MS) | F-001 (Device-Pfad-Format, konstantes Präfix) |
+| EXT-007 | https://github.com/hyperkineticnerd/OpenCorsairLink/issues/70 | Community (USB-Dump) | F-001 (Gerät meldet iSerial → Edge-Fall) |

@@ -408,10 +408,13 @@ static void settings_write_string(HKEY key, const wchar_t *name, const wchar_t *
 
 /* Derive a stable key that identifies the PHYSICAL controller, not the USB
  * port. Prefers the USB serial number (stable + unique across reboots and
- * port moves). Falls back to the stable hardware prefix of the device path
- * (everything before the first '#', which excludes the port-dependent
- * instance ID). The previous full-path hash changed when the controller was
- * moved to a different port, silently losing per-device settings. */
+ * port moves). Falls back to VID:PID plus the hardware prefix of the device
+ * path (everything before the first '#', which excludes the port-dependent
+ * instance ID). The prefix alone is constant for all HID devices (\\?\\HID),
+ * so the VID/PID is included to keep serial-less controllers apart; two
+ * identical serial-less devices (same VID/PID) can still collide. The
+ * previous full-path hash changed when the controller was moved to a
+ * different port, silently losing per-device settings. */
 static void device_settings_key(const CorsairDeviceInfo *info, wchar_t *key,
                                 size_t key_count)
 {
@@ -426,12 +429,18 @@ static void device_settings_key(const CorsairDeviceInfo *info, wchar_t *key,
         text = ident;
     } else {
         const wchar_t *path = info && info->path[0] ? info->path : L"unknown";
+        wchar_t prefix[64];
         size_t i = 0;
-        while (path[i] != L'\0' && path[i] != L'#' && i + 1 < 160) {
-            ident[i] = path[i];
+        while (path[i] != L'\0' && path[i] != L'#' && i + 1 < 64) {
+            prefix[i] = path[i];
             ++i;
         }
-        ident[i] = L'\0';
+        prefix[i] = L'\0';
+        /* The prefix before the first '#' is constant (\\?\\HID), so the
+         * VID/PID carries the distinguishing part. */
+        swprintf(ident, 160, L"hw:%04X:%04X:%s",
+                 info ? (unsigned)info->vendor_id : 0,
+                 info ? (unsigned)info->product_id : 0, prefix);
         text = ident;
     }
 
@@ -2137,6 +2146,16 @@ static LRESULT CALLBACK overview_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam,
     AppState *app = &g_app;
 
     switch (msg) {
+    case WM_ERASEBKGND: {
+        /* The class background brush is NULL, so the window erases with the
+         * *current* theme brush; a handle stored in the class would go stale
+         * when ui_set_dpi recreates the theme assets. */
+        RECT client;
+        GetClientRect(hwnd, &client);
+        FillRect((HDC)wparam, &client, ui_theme()->ink_brush);
+        return 1;
+    }
+
     case WM_CREATE: {
         app->overview_window = hwnd;
         create_overview_controls(app, hwnd);
@@ -2622,6 +2641,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     }
 
     switch (msg) {
+    case WM_ERASEBKGND: {
+        /* The class background brush is NULL, so the window erases with the
+         * *current* theme brush; a handle stored in the class would go stale
+         * when ui_set_dpi recreates the theme assets. */
+        RECT client;
+        GetClientRect(hwnd, &client);
+        FillRect((HDC)wparam, &client, ui_theme()->ink_brush);
+        return 1;
+    }
+
     case WM_CREATE:
         app->hwnd = hwnd;
         create_main_controls(app, hwnd);
@@ -2845,7 +2874,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line,
     }
 
     ui_init();
-    UiTheme *t = ui_theme();
 
     INITCOMMONCONTROLSEX icc;
     WNDCLASSW wc;
@@ -2885,7 +2913,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line,
     wc.lpszClassName = L"CorsairNvidiaFanControlWindow";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
-    wc.hbrBackground = t->ink_brush;
+    /* Background erasing is handled in wnd_proc/overview_wnd_proc
+     * (WM_ERASEBKGND) with the current theme brush; a brush stored in the
+     * class goes stale after ui_set_dpi recreates the theme assets. */
+    wc.hbrBackground = NULL;
 
     if (!RegisterClassW(&wc)) {
         MessageBoxW(NULL, L"Could not register window class.", APP_TITLE, MB_ICONERROR);
