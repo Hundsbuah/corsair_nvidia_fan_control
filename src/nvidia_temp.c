@@ -18,6 +18,8 @@
 #define NVAPI_ID_ENUM_PHYSICAL_GPUS 0xe5ac921f
 #define NVAPI_ID_GPU_GET_FULL_NAME 0xceee8e9f
 #define NVAPI_ID_GPU_GET_THERMAL_SETTINGS 0xe3640a56
+#define NVAPI_ID_GPU_GET_CURRENT_VOLTAGE 0x465f9bcf
+#define NVAPI_ID_GPU_GET_VOLTAGE_DOMAINS_STATUS 0x0c16c7e2c
 
 #define MAKE_NVAPI_VERSION(type_name, version) ((unsigned int)(sizeof(type_name) | ((version) << 16)))
 
@@ -53,6 +55,33 @@ typedef struct NvGpuThermalSettings {
     } sensor[NVAPI_MAX_THERMAL_SENSORS_PER_GPU];
 } NvGpuThermalSettings;
 
+/* Undocumented NVAPI live core-voltage query (interface 0x465F9BCF). This is
+ * the call that works on modern drivers: on Blackwell (RTX 5090) the older
+ * voltage-domain APIs below all return NOT_SUPPORTED, while this one returns
+ * the live rail in microvolts. NVML and nvidia-smi expose no voltage at all
+ * (nvidia-smi dropped voltage reporting in driver branch 570+). The struct is
+ * exactly 76 bytes (NV_STRUCT_VERSION(size, 1)); value_uV is at offset 36. */
+typedef struct NvGpuCurrentVoltageStatus {
+    NvU32 version;
+    NvU32 flags;
+    NvU32 zero[8];
+    NvU32 value_uV;
+    NvU32 unknown[8];
+} NvGpuCurrentVoltageStatus;
+
+/* Fallback for older (Maxwell/Pascal-era) GPUs: undocumented voltage-domain
+ * query (interface 0x0C16C7E2C) as used by NVFC. Same 140-byte struct family;
+ * entry 0 is the core domain, values in microvolts. */
+typedef struct NvGpuVoltageDomainsStatus {
+    NvU32 version;
+    NvU32 flags;
+    NvU32 count;
+    struct {
+        NvU32 voltage_domain;
+        NvU32 current_voltage_uv;
+    } entries[16];
+} NvGpuVoltageDomainsStatus;
+
 typedef void *(__cdecl *NvAPI_QueryInterfaceFn)(unsigned int id);
 typedef NvAPI_Status(__cdecl *NvAPI_InitializeFn)(void);
 typedef NvAPI_Status(__cdecl *NvAPI_UnloadFn)(void);
@@ -62,6 +91,10 @@ typedef NvAPI_Status(__cdecl *NvAPI_EnumPhysicalGPUsFn)(NvPhysicalGpuHandle hand
 typedef NvAPI_Status(__cdecl *NvAPI_GPU_GetFullNameFn)(NvPhysicalGpuHandle handle, NvAPI_ShortString name);
 typedef NvAPI_Status(__cdecl *NvAPI_GPU_GetThermalSettingsFn)(NvPhysicalGpuHandle handle, NvU32 sensor_index,
                                                                NvGpuThermalSettings *settings);
+typedef NvAPI_Status(__cdecl *NvAPI_GPU_GetVoltageDomainsStatusFn)(NvPhysicalGpuHandle handle,
+                                                                    NvGpuVoltageDomainsStatus *status);
+typedef NvAPI_Status(__cdecl *NvAPI_GPU_GetCurrentVoltageFn)(NvPhysicalGpuHandle handle,
+                                                             NvGpuCurrentVoltageStatus *status);
 
 typedef struct NvApi {
     HMODULE dll;
@@ -72,6 +105,8 @@ typedef struct NvApi {
     NvAPI_EnumPhysicalGPUsFn enum_physical_gpus;
     NvAPI_GPU_GetFullNameFn gpu_get_full_name;
     NvAPI_GPU_GetThermalSettingsFn gpu_get_thermal_settings;
+    NvAPI_GPU_GetVoltageDomainsStatusFn gpu_get_voltage_domains_status;
+    NvAPI_GPU_GetCurrentVoltageFn gpu_get_current_voltage;
 } NvApi;
 
 static void set_error(char *err, size_t err_len, const char *fmt, ...)
@@ -168,6 +203,12 @@ static bool nvapi_load(NvApi *api, char *err, size_t err_len)
     api->gpu_get_full_name = (NvAPI_GPU_GetFullNameFn)load_fn(api, NVAPI_ID_GPU_GET_FULL_NAME);
     api->gpu_get_thermal_settings =
         (NvAPI_GPU_GetThermalSettingsFn)load_fn(api, NVAPI_ID_GPU_GET_THERMAL_SETTINGS);
+    /* Optional: the undocumented voltage calls may be absent from very old
+     * drivers; keep the session alive even when they are missing. */
+    api->gpu_get_voltage_domains_status =
+        (NvAPI_GPU_GetVoltageDomainsStatusFn)load_fn(api, NVAPI_ID_GPU_GET_VOLTAGE_DOMAINS_STATUS);
+    api->gpu_get_current_voltage =
+        (NvAPI_GPU_GetCurrentVoltageFn)load_fn(api, NVAPI_ID_GPU_GET_CURRENT_VOLTAGE);
 
     if (!api->initialize || !api->enum_physical_gpus || !api->gpu_get_thermal_settings) {
         set_error(err, err_len, "Required NVAPI functions are missing.");
@@ -231,6 +272,13 @@ static bool valid_temp(int temp)
     return temp >= -20 && temp <= 125;
 }
 
+static bool valid_voltage_mv(int mv)
+{
+    /* Plausible core-voltage window for consumer GPUs: 0.2-2.0 V. Anything
+     * outside it is sensor noise / an unsupported read, not a real value. */
+    return mv >= 200 && mv <= 2000;
+}
+
 bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
 {
     NvApi *api = &g_nvapi;
@@ -276,6 +324,37 @@ bool nvidia_temp_read(NvidiaGpuStatus *status, char *err, size_t err_len)
     }
     if (status->name[0] == '\0') {
         copy_str(status->name, sizeof(status->name), "NVIDIA GPU");
+    }
+
+    /* Optional core-voltage read: failures (NOT_SUPPORTED on some GPUs /
+     * drivers) only suppress the value; they never fail the whole read.
+     * Modern drivers (tested on RTX 5090/Blackwell): GetCurrentVoltage works,
+     * the domain query is NOT_SUPPORTED. Older GPUs: the other way around. */
+    if (api->gpu_get_current_voltage) {
+        NvGpuCurrentVoltageStatus volt = { 0 };
+
+        volt.version = MAKE_NVAPI_VERSION(NvGpuCurrentVoltageStatus, 1);
+        nvstatus = api->gpu_get_current_voltage(handles[0], &volt);
+        if (nvstatus == NVAPI_OK && valid_voltage_mv((int)(volt.value_uV / 1000))) {
+            status->voltage_mv = (int)(volt.value_uV / 1000);
+            status->have_voltage = true;
+        }
+    }
+    if (!status->have_voltage && api->gpu_get_voltage_domains_status) {
+        NvGpuVoltageDomainsStatus volt = { 0 };
+
+        volt.version = MAKE_NVAPI_VERSION(NvGpuVoltageDomainsStatus, 1);
+        nvstatus = api->gpu_get_voltage_domains_status(handles[0], &volt);
+        if (nvstatus == NVAPI_OK) {
+            for (NvU32 i = 0; i < volt.count && i < 16; ++i) {
+                int mv = (int)(volt.entries[i].current_voltage_uv / 1000);
+                if (valid_voltage_mv(mv)) {
+                    status->voltage_mv = mv;
+                    status->have_voltage = true;
+                    break;
+                }
+            }
+        }
     }
 
     memset(&thermal, 0, sizeof(thermal));

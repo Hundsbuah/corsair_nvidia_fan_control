@@ -1171,9 +1171,16 @@ static void update_gpu_stats_view(AppState *app)
             }
             break;
         case 2:
-            /* No public driver API exposes the live core voltage (neither
-             * NVML nor NVAPI does), so the row stays a quiet placeholder. */
-            copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            /* Live core voltage via the undocumented NVAPI GetCurrentVoltage
+             * call (see nvidia_temp.c); NVML/nvidia-smi expose no voltage.
+             * Falls back to a quiet placeholder when the GPU/driver does not
+             * report it. */
+            if (app->gpu.have_voltage) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d mV",
+                         app->gpu.voltage_mv);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
             break;
         case 3:
             if (s->have_fan) {
@@ -1223,6 +1230,8 @@ static void refresh_gpu_status(AppState *app)
         strcpy_s(app->gpu.name, sizeof(app->gpu.name), "GeForce RTX 4090 (Test)");
         double phase = (double)GetTickCount() / 25000.0;
         app->gpu.temperature_c = (int)(56.0 + 10.0 * sin(phase));
+        app->gpu.voltage_mv = (int)(780.0 + 120.0 * sin(phase * 1.7));
+        app->gpu.have_voltage = true;
         app->gpu_ok = true;
     }
     update_gpu_status_view(app, app->gpu_ok ? NULL : err);

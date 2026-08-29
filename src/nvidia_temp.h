@@ -7,6 +7,8 @@ typedef struct NvidiaGpuStatus {
     bool available;
     int gpu_count;
     int temperature_c;
+    int voltage_mv;   /* live core voltage in millivolts, valid when have_voltage */
+    bool have_voltage;
     char name[64];
 } NvidiaGpuStatus;
 
