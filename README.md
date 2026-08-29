@@ -18,6 +18,10 @@ without iCUE. It uses the device's USB HID protocol directly and targets:
 - Reads the first NVIDIA GPU core temperature through NVAPI and can run a
   multi-point GPU-temperature fan curve, edited directly on the curve graph,
   across every detected controller.
+- Shows a live GPU telemetry panel (GPU clock, memory clock, fan speed,
+  board power draw and power limit) read through NVML, with a power-
+  utilisation meter. The voltage row is a placeholder: neither NVML nor
+  NVAPI exposes the live core voltage through a public interface.
 - Saves fan modes, fixed duty values, selected controller and GPU curve points
   and can reapply them automatically on startup.
 - Can register itself for login autostart and run minimized in the Windows

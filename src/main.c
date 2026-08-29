@@ -1,4 +1,5 @@
 #include "corsair_hid.h"
+#include "gpu_stats.h"
 #include "nvidia_temp.h"
 #include "resource.h"
 #include "ui.h"
@@ -37,6 +38,8 @@
 #define IDC_UPDATE_INTERVAL 907
 #define REFRESH_TIMER 1
 #define TRAY_RETRY_TIMER 2
+/* GPU telemetry readout rows (index order = row order in the panel). */
+#define STAT_ROW_COUNT 6
 /* Update (poll) interval: adjustable between UPDATE_MIN_MS and UPDATE_MAX_MS.
  * A slider maps position 0 (slowest, max ms) .. 100 (fastest, min ms). */
 #define UPDATE_MIN_MS 500
@@ -127,6 +130,13 @@ typedef struct AppState {
     /* GPU curve */
     HWND curve_hint;
     HWND curve_hint2;
+    /* GPU telemetry column */
+    HWND stats_panel;
+    HWND stats_heading;
+    HWND stat_labels[STAT_ROW_COUNT];
+    HWND stat_values[STAT_ROW_COUNT];
+    HWND stats_meter;
+    GpuStats gpu_stats;
     /* Panel headings / static labels (moved by layout) */
     HWND fans_heading;
     HWND sensors_heading;
@@ -1137,6 +1147,72 @@ static void update_gpu_status_view(AppState *app, const char *err)
     SetWindowTextW(app->gpu_status_label, text);
 }
 
+static void update_gpu_stats_view(AppState *app)
+{
+    GpuStats *s = &app->gpu_stats;
+    wchar_t text[32];
+
+    for (int i = 0; i < STAT_ROW_COUNT; ++i) {
+        switch (i) {
+        case 0:
+            if (s->have_clocks) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d MHz",
+                         s->gpu_clock_mhz);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        case 1:
+            if (s->have_clocks) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d MHz",
+                         s->mem_clock_mhz);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        case 2:
+            /* No public driver API exposes the live core voltage (neither
+             * NVML nor NVAPI does), so the row stays a quiet placeholder. */
+            copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            break;
+        case 3:
+            if (s->have_fan) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d %%",
+                         s->fan_speed_pct);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        case 4:
+            if (s->have_power) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d W",
+                         s->power_mw / 1000);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        default:
+            if (s->have_limit) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d W",
+                         s->power_limit_mw / 1000);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        }
+        SetWindowTextW(app->stat_values[i], text);
+    }
+
+    int pct = -1;
+    if (s->have_power && s->have_limit && s->power_limit_mw > 0) {
+        pct = s->power_mw * 100 / s->power_limit_mw;
+        if (pct > 100) {
+            pct = 100;
+        }
+    }
+    ui_meter_set(app->stats_meter, pct);
+}
+
 static void refresh_gpu_status(AppState *app)
 {
     char err[256] = { 0 };
@@ -1160,6 +1236,24 @@ static void refresh_gpu_status(AppState *app)
         copy_wstr(readout, sizeof(readout) / sizeof(readout[0]), L"— °C");
     }
     SetWindowTextW(app->gpu_readout, readout);
+
+    if (fake_device_enabled()) {
+        /* Fake telemetry so the panel can be developed and screenshotted
+         * without a GPU. */
+        GpuStats *s = &app->gpu_stats;
+        double phase = (double)GetTickCount() / 25000.0;
+        memset(s, 0, sizeof(*s));
+        s->available = true;
+        s->have_clocks = s->have_fan = s->have_power = s->have_limit = true;
+        s->gpu_clock_mhz = (int)(2200.0 + 500.0 * sin(phase * 1.3));
+        s->mem_clock_mhz = 16801;
+        s->fan_speed_pct = (int)(55.0 + 10.0 * sin(phase));
+        s->power_mw = (int)(420000.0 + 80000.0 * sin(phase * 0.7));
+        s->power_limit_mw = 720000;
+    } else {
+        gpu_stats_read(&app->gpu_stats);
+    }
+    update_gpu_stats_view(app);
 }
 
 static void update_visual_state(AppState *app)
@@ -2488,6 +2582,38 @@ static void create_main_controls(AppState *app, HWND hwnd)
     ui_register_font_role(app->update_readout, UI_FONT_MONO_BOLD);
     ui_register_ctrl(app->update_readout, UI_BG_PANEL, t->text);
 
+    /* Telemetry column ----------------------------------------------------- */
+    int x_s = x_r + ui_px(264) + ui_px(12);
+    app->stats_panel = ui_make_control(hwnd, UI_CLASS_PANEL, 0, x_s, ui_px(74),
+                                       ui_px(224), ui_px(556), 0);
+    app->stats_heading = make_child(hwnd, WC_STATICW, L"GPU TELEMETRY", SS_LEFT,
+                                    x_s + ui_px(12), ui_px(84), ui_px(160), ui_px(16),
+                                    0);
+    ui_register_font_role(app->stats_heading, UI_FONT_HEADING);
+    ui_register_ctrl(app->stats_heading, UI_BG_PANEL, t->dim);
+
+    static const wchar_t *stat_names[STAT_ROW_COUNT] = {
+        L"GPU Clock", L"Memory Clock", L"Voltage", L"Fan Speed",
+        L"Board Power", L"Power Limit"
+    };
+    for (int i = 0; i < STAT_ROW_COUNT; ++i) {
+        app->stat_labels[i] = make_child(hwnd, WC_STATICW, stat_names[i], SS_LEFT,
+                                         x_s + ui_px(12), ui_px(110) + i * ui_px(30),
+                                         ui_px(104), ui_px(16), 0);
+        ui_register_font_role(app->stat_labels[i], UI_FONT_CAPTION);
+        ui_register_ctrl(app->stat_labels[i], UI_BG_PANEL, t->dim);
+
+        app->stat_values[i] = make_child(hwnd, WC_STATICW, L"—", SS_RIGHT,
+                                         x_s + ui_px(120), ui_px(110) + i * ui_px(30),
+                                         ui_px(92), ui_px(16), 0);
+        ui_register_font_role(app->stat_values[i], UI_FONT_MONO);
+        ui_register_ctrl(app->stat_values[i], UI_BG_PANEL, t->text);
+    }
+
+    /* Board-power utilisation meter (between Board Power and Power Limit). */
+    app->stats_meter = ui_make_control(hwnd, UI_CLASS_METER, 0, x_s + ui_px(12),
+                                       ui_px(262), ui_px(200), ui_px(10), 0);
+
     /* Footer ------------------------------------------------------------- */
     app->device_combo = ui_make_control(hwnd, UI_CLASS_COMBO, WS_TABSTOP, ui_px(14),
                                         ui_px(616), ui_px(210), ui_px(28),
@@ -2533,6 +2659,8 @@ static void create_main_controls(AppState *app, HWND hwnd)
                      SWP_NOMOVE | SWP_NOSIZE);
     SetWindowPos(app->options_panel, HWND_BOTTOM, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE);
+    SetWindowPos(app->stats_panel, HWND_BOTTOM, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE);
 
     load_global_settings(app);
     app->update_ms = clamp_int(app->update_ms, UPDATE_MIN_MS, UPDATE_MAX_MS);
@@ -2569,8 +2697,10 @@ static void layout_main(AppState *app)
     int body_bottom = h - m - footer_h - ui_px(8);
     int body_h = body_bottom - body_top;
     int right_w = ui_px(264);
-    int left_w = w - m * 2 - right_w - gap;
+    int stats_w = ui_px(224);
+    int left_w = w - m * 2 - right_w - stats_w - gap * 2;
     int x_r = m + left_w + gap;
+    int x_s = x_r + right_w + gap;
 
     int sens_h = body_h >= ui_px(552) ? ui_px(92) : ui_px(80);
     int rail_h = sens_h;
@@ -2694,6 +2824,32 @@ static void layout_main(AppState *app)
                ui_px(56), ui_px(16), TRUE);
     MoveWindow(app->save_btn, x_r + ui_px(12), options_top + opts_h - ui_px(38),
                right_w - ui_px(24), ui_px(28), TRUE);
+
+    /* Telemetry column. Six readout rows plus the power meter are spread
+     * evenly across the body height (seven slots); the meter owns slot 5,
+     * so the Power Limit row is the last one. */
+    MoveWindow(app->stats_panel, x_s, body_top, stats_w, body_h, TRUE);
+    MoveWindow(app->stats_heading, x_s + ui_px(12), body_top + ui_px(10),
+               ui_px(160), ui_px(16), TRUE);
+    int stat_slots = 7;
+    int stat_area_top = body_top + ui_px(52);
+    int stat_area_bottom = body_bottom - ui_px(12);
+    int stat_pitch = (stat_area_bottom - stat_area_top) / stat_slots;
+    if (stat_pitch < ui_px(22)) {
+        stat_pitch = ui_px(22);
+    }
+    for (int i = 0; i < STAT_ROW_COUNT; ++i) {
+        int slot = (i < 5) ? i : 6;
+        int y = stat_area_top + slot * stat_pitch + (stat_pitch - ui_px(16)) / 2;
+        MoveWindow(app->stat_labels[i], x_s + ui_px(12), y, ui_px(104), ui_px(16),
+                   TRUE);
+        MoveWindow(app->stat_values[i], x_s + stats_w - ui_px(12) - ui_px(92), y,
+                   ui_px(92), ui_px(16), TRUE);
+    }
+    int meter_y =
+        stat_area_top + 5 * stat_pitch + (stat_pitch - ui_px(10)) / 2;
+    MoveWindow(app->stats_meter, x_s + ui_px(12), meter_y, stats_w - ui_px(24),
+               ui_px(10), TRUE);
 
     /* Footer. */
     int footer_y = h - m - footer_h;
@@ -2901,7 +3057,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *info = (MINMAXINFO *)lparam;
-        info->ptMinTrackSize.x = ui_px(820);
+        info->ptMinTrackSize.x = ui_px(1040);
         info->ptMinTrackSize.y = ui_px(690);
         return 0;
     }
@@ -2932,6 +3088,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         KillTimer(hwnd, REFRESH_TIMER);
         KillTimer(hwnd, TRAY_RETRY_TIMER);
         save_settings(app);
+        gpu_stats_shutdown();
         if (app->tray_added) {
             tray_update(app, NIM_DELETE);
         }
@@ -3023,7 +3180,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR cmd_line,
 
     hwnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
                            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 900, 720, NULL, NULL, instance,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1128, 720, NULL, NULL, instance,
                            NULL);
     if (!hwnd) {
         MessageBoxW(NULL, L"Could not create main window.", APP_TITLE, MB_ICONERROR);

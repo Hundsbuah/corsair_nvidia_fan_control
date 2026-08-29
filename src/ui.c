@@ -48,6 +48,7 @@ static LRESULT CALLBACK slider_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK combo_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK curve_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK dot_proc(HWND, UINT, WPARAM, LPARAM);
+static LRESULT CALLBACK meter_proc(HWND, UINT, WPARAM, LPARAM);
 static LRESULT CALLBACK header_proc(HWND, UINT, WPARAM, LPARAM);
 
 /* ------------------------------------------------------------------ theme */
@@ -168,6 +169,7 @@ void ui_init(void)
         { UI_CLASS_COMBO, (WNDPROC)combo_proc },
         { UI_CLASS_CURVE, (WNDPROC)curve_proc },
         { UI_CLASS_DOT, (WNDPROC)dot_proc },
+        { UI_CLASS_METER, (WNDPROC)meter_proc },
     };
     for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); ++i) {
         WNDCLASSW wc;
@@ -1794,6 +1796,87 @@ void ui_dot_set(HWND hwnd, int state)
     UiDotData *d = (UiDotData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (d && d->state != state) {
         d->state = state;
+        InvalidateRect(hwnd, NULL, FALSE);
+    }
+}
+
+/* ------------------------------------------------------------- meter */
+
+typedef struct UiMeterData {
+    int pct; /* 0-100; negative = empty track */
+} UiMeterData;
+
+static LRESULT CALLBACK meter_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    (void)wparam;
+    (void)lparam;
+    UiMeterData *m = (UiMeterData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_NCCREATE: {
+        UiMeterData *data = (UiMeterData *)HeapAlloc(GetProcessHeap(), 0,
+                                                     sizeof(UiMeterData));
+        data->pct = -1;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        RECT client;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        UiTheme *t = ui_theme();
+        GetClientRect(hwnd, &client);
+
+        /* Opaque full cover first so no stale/erased pixels can show through.
+         * Fill with the panel_alt brush itself; SelectObject returns the
+         * previously selected object, not the one being selected. */
+        HBRUSH track_brush = t->panel_alt_brush ? t->panel_alt_brush
+                                                : GetStockObject(BLACK_BRUSH);
+        HGDIOBJ old_brush = SelectObject(hdc, track_brush);
+        FillRect(hdc, &client, track_brush);
+        SelectObject(hdc, old_brush);
+
+        int pct = m ? m->pct : -1;
+        if (pct > 0) {
+            if (pct > 100) {
+                pct = 100;
+            }
+            int width = (client.right - client.left) * pct / 100;
+            if (width < ui_px(6)) {
+                width = ui_px(6);
+            }
+            RECT fill;
+            fill.left = client.left;
+            fill.top = client.top;
+            fill.right = client.left + width;
+            fill.bottom = client.bottom;
+            HBRUSH color = pct >= 95 ? CreateSolidBrush(t->warn)
+                                     : CreateSolidBrush(t->accent);
+            FillRect(hdc, &fill, color);
+            DeleteObject(color);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DESTROY: {
+        UiMeterData *data = (UiMeterData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (data) {
+            HeapFree(GetProcessHeap(), 0, data);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+void ui_meter_set(HWND hwnd, int pct)
+{
+    UiMeterData *m = (UiMeterData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (m && m->pct != pct) {
+        m->pct = pct;
         InvalidateRect(hwnd, NULL, FALSE);
     }
 }

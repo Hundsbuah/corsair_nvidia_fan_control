@@ -72,6 +72,7 @@ int ui_px(int v);                   /* scale a 96-dpi pixel value            */
 #define UI_CLASS_COMBO L"CfcCombo"
 #define UI_CLASS_CURVE L"CfcCurve"
 #define UI_CLASS_DOT L"CfcDot"
+#define UI_CLASS_METER L"CfcMeter"
 
 HWND ui_make_control(HWND parent, const wchar_t *class_name, DWORD extra_style,
                      int x, int y, int w, int h, int id);
@@ -104,6 +105,12 @@ void ui_curve_set_now(HWND hwnd, int temperature_c, bool ok);
 
 /* Status dot --------------------------------------------------------------- */
 void ui_dot_set(HWND hwnd, int state);                /* UI_DOT_*            */
+
+/* Meter (thin utilisation bar) ---------------------------------------------
+ * Renders a 0-100% fill over the track. Negative values render an empty
+ * track. At 95% and above the fill switches from the accent colour to the
+ * warning colour so a rail near its limit is visible at a glance. */
+void ui_meter_set(HWND hwnd, int pct);
 
 /* Color helpers ------------------------------------------------------------ */
 COLORREF ui_status_color(int state);                  /* UI_DOT_* -> color   */

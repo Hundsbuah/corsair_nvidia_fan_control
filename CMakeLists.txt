@@ -6,6 +6,7 @@ add_executable(corsair_nvidia_fan_control WIN32
     src/main.c
     src/ui.c
     src/corsair_hid.c
+    src/gpu_stats.c
     src/nvidia_temp.c
     src/resources.rc
 )
