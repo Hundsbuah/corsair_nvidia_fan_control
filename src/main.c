@@ -39,7 +39,7 @@
 #define REFRESH_TIMER 1
 #define TRAY_RETRY_TIMER 2
 /* GPU telemetry readout rows (index order = row order in the panel). */
-#define STAT_ROW_COUNT 7
+#define STAT_ROW_COUNT 8
 /* Update (poll) interval: adjustable between UPDATE_MIN_MS and UPDATE_MAX_MS.
  * A slider maps position 0 (slowest, max ms) .. 100 (fastest, min ms). */
 #define UPDATE_MIN_MS 500
@@ -1155,9 +1155,9 @@ static void update_gpu_stats_view(AppState *app)
     for (int i = 0; i < STAT_ROW_COUNT; ++i) {
         switch (i) {
         case 0:
-            if (s->have_clocks) {
-                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d MHz",
-                         s->gpu_clock_mhz);
+            if (app->gpu_ok) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d \u00b0C",
+                         app->gpu.temperature_c);
             } else {
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
@@ -1165,12 +1165,20 @@ static void update_gpu_stats_view(AppState *app)
         case 1:
             if (s->have_clocks) {
                 swprintf(text, sizeof(text) / sizeof(text[0]), L"%d MHz",
-                         s->mem_clock_mhz);
+                         s->gpu_clock_mhz);
             } else {
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
         case 2:
+            if (s->have_clocks) {
+                swprintf(text, sizeof(text) / sizeof(text[0]), L"%d MHz",
+                         s->mem_clock_mhz);
+            } else {
+                copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
+            }
+            break;
+        case 3:
             /* Live core voltage via the undocumented NVAPI GetCurrentVoltage
              * call (see nvidia_temp.c); NVML/nvidia-smi expose no voltage.
              * Falls back to a quiet placeholder when the GPU/driver does not
@@ -1182,7 +1190,7 @@ static void update_gpu_stats_view(AppState *app)
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
-        case 3:
+        case 4:
             if (s->have_fan) {
                 swprintf(text, sizeof(text) / sizeof(text[0]), L"%d %%",
                          s->fan_speed_pct);
@@ -1190,7 +1198,7 @@ static void update_gpu_stats_view(AppState *app)
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
-        case 4:
+        case 5:
             if (s->have_power) {
                 swprintf(text, sizeof(text) / sizeof(text[0]), L"%d W",
                          s->power_mw / 1000);
@@ -1198,7 +1206,7 @@ static void update_gpu_stats_view(AppState *app)
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
-        case 5:
+        case 6:
             if (s->have_limit) {
                 swprintf(text, sizeof(text) / sizeof(text[0]), L"%d W",
                          s->power_limit_mw / 1000);
@@ -1206,7 +1214,7 @@ static void update_gpu_stats_view(AppState *app)
                 copy_wstr(text, sizeof(text) / sizeof(text[0]), L"—");
             }
             break;
-        case 6:
+        case 7:
             if (s->have_throttle) {
                 unsigned long long t = s->throttle_status;
                 if (t & (NVML_EVENT_HW_THERMAL_SLOWDOWN | NVML_EVENT_SW_THERMAL_SLOWDOWN)) {
@@ -2624,7 +2632,7 @@ static void create_main_controls(AppState *app, HWND hwnd)
     ui_register_ctrl(app->stats_heading, UI_BG_PANEL, t->dim);
 
     static const wchar_t *stat_names[STAT_ROW_COUNT] = {
-        L"GPU Clock", L"Memory Clock", L"Voltage", L"Fan Speed",
+        L"GPU Core", L"GPU Clock", L"Memory Clock", L"Voltage", L"Fan Speed",
         L"Board Power", L"Power Limit", L"Throttle"
     };
     for (int i = 0; i < STAT_ROW_COUNT; ++i) {
@@ -2712,13 +2720,10 @@ static void layout_main(AppState *app)
     int gap = ui_px(12);
 
     /* Header. */
-    int readout_w = ui_px(150);
     MoveWindow(app->title_label, m, ui_px(12), ui_px(360), ui_px(24), TRUE);
     MoveWindow(app->device_subtitle, m, ui_px(36), ui_px(420), ui_px(18), TRUE);
-    MoveWindow(app->gpu_caption, w - m - readout_w, ui_px(12), readout_w, ui_px(14),
-               TRUE);
-    MoveWindow(app->gpu_readout, w - m - readout_w, ui_px(26), readout_w, ui_px(34),
-               TRUE);
+    MoveWindow(app->gpu_caption, 0, 0, 0, 0, FALSE);
+    MoveWindow(app->gpu_readout, 0, 0, 0, 0, FALSE);
     MoveWindow(app->status_dot, 0, 0, 0, 0, FALSE);
 
     /* Body. */
@@ -2861,7 +2866,7 @@ static void layout_main(AppState *app)
     MoveWindow(app->stats_panel, x_s, body_top, stats_w, body_h, TRUE);
     MoveWindow(app->stats_heading, x_s + ui_px(12), body_top + ui_px(10),
                ui_px(160), ui_px(16), TRUE);
-    int stat_slots = 8;
+    int stat_slots = 9;
     int stat_area_top = body_top + ui_px(52);
     int stat_area_bottom = body_bottom - ui_px(12);
     int stat_pitch = (stat_area_bottom - stat_area_top) / stat_slots;
