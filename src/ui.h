@@ -116,6 +116,7 @@ HBRUSH ui_handle_ctrl_color(HWND parent, HDC hdc, HWND child);
  * Child font role must have been registered with ui_register_font_role.    */
 void ui_register_font_role(HWND hwnd, int role);
 void ui_register_ctrl(HWND hwnd, int bg, COLORREF color); /* color 0 = text  */
+void ui_set_corner_bg(HWND hwnd, COLORREF bg);            /* rounded corners */
 void ui_apply_fonts(HWND hwnd);                       /* re-send WM_SETFONT  */
 
 /* Dark list view setup: custom-drawn rows and a dark header.

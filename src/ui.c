@@ -31,6 +31,9 @@ typedef struct UiRegistryEntry {
     COLORREF color; /* text color */
     bool has_font;
     bool has_ctrl;
+    COLORREF corner_bg; /* fill for the 4 square corners outside the rounded
+                          * body; defaults to the panel colour. */
+    bool has_corner_bg;
 } UiRegistryEntry;
 
 static UiTheme g_theme;
@@ -282,6 +285,7 @@ static void ui_reg_prune(void)
             g_registry[i].hwnd = NULL;
             g_registry[i].has_font = false;
             g_registry[i].has_ctrl = false;
+            g_registry[i].has_corner_bg = false;
         }
     }
 }
@@ -329,6 +333,31 @@ void ui_register_ctrl(HWND hwnd, int bg, COLORREF color)
     entry->bg = bg;
     entry->color = color ? color : g_theme.text;
     entry->has_ctrl = true;
+}
+
+void ui_set_corner_bg(HWND hwnd, COLORREF bg)
+{
+    UiRegistryEntry *entry = ui_reg_find(hwnd);
+    if (!entry) {
+        entry = ui_reg_new();
+        if (!entry) {
+            return;
+        }
+        entry->hwnd = hwnd;
+    }
+    entry->corner_bg = bg;
+    entry->has_corner_bg = true;
+}
+
+/* Corner fill for a rounded control's WM_PAINT. ui_fill_stroke_rounded only
+ * fills the interior of the rounded path, so the four square corners outside
+ * it must be painted with whatever colour sits directly behind the control.
+ * Defaults to the panel colour (the card a control usually sits on); controls
+ * placed on the window background opt in to ink via ui_set_corner_bg(). */
+static COLORREF ui_corner_bg(HWND hwnd)
+{
+    UiRegistryEntry *entry = ui_reg_find(hwnd);
+    return (entry && entry->has_corner_bg) ? entry->corner_bg : g_theme.panel;
 }
 
 void ui_apply_fonts(HWND hwnd)
@@ -551,6 +580,9 @@ static LRESULT CALLBACK button_proc(HWND hwnd, UINT msg, WPARAM wparam,
         HBITMAP bits;
         HDC mem;
         HDC hdc = ui_memdc_begin(hwnd, &ps, &client, &bits, &mem);
+        HBRUSH corner = CreateSolidBrush(ui_corner_bg(hwnd));
+        FillRect(mem, &client, corner);
+        DeleteObject(corner);
 
         int variant = d ? d->variant : UI_BTN_SUBTLE;
         HBRUSH fill;
@@ -961,6 +993,9 @@ static LRESULT CALLBACK combo_proc(HWND hwnd, UINT msg, WPARAM wparam,
         HBITMAP bits;
         HDC mem;
         HDC hdc = ui_memdc_begin(hwnd, &ps, &client, &bits, &mem);
+        HBRUSH corner = CreateSolidBrush(ui_corner_bg(hwnd));
+        FillRect(mem, &client, corner);
+        DeleteObject(corner);
 
         HBRUSH fill = (d && d->hot) ? t->panel_alt_brush : t->panel_brush;
         HBRUSH border = (d && d->hot) ? t->edge_hi_brush : t->edge_brush;

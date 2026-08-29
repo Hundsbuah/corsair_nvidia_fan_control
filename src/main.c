@@ -34,16 +34,18 @@
 #define IDC_GPU_STATUS 900
 #define IDC_AUTOSTART 905
 #define IDC_SAVE_SETTINGS 906
+#define IDC_UPDATE_INTERVAL 907
 #define REFRESH_TIMER 1
 #define TRAY_RETRY_TIMER 2
-#define POLL_INTERVAL_MS 5000
-/* Sensor reads (corsair_refresh) run every REFRESH_EVERY_TICKS-th refresh
- * tick; the UI repaints every tick with the last known values. This halves
- * the worst-case HID I/O per tick on the UI thread. A controller whose last
- * refresh cycle failed is skipped entirely until every
- * REFRESH_FAIL_RETRY_EVERY-th tick so a dead device does not trigger a
- * close + reopen + full initialize on every 5 s tick. */
-#define REFRESH_EVERY_TICKS 2
+/* Update (poll) interval: adjustable between UPDATE_MIN_MS and UPDATE_MAX_MS.
+ * A slider maps position 0 (slowest, max ms) .. 100 (fastest, min ms). */
+#define UPDATE_MIN_MS 500
+#define UPDATE_MAX_MS 5000
+#define UPDATE_DEFAULT_MS 5000
+/* Sensor reads (corsair_refresh) run on every refresh tick, i.e. at the same
+ * interval as the GUI refresh. A controller whose last refresh cycle failed
+ * is skipped until every REFRESH_FAIL_RETRY_EVERY-th tick so a dead device
+ * does not trigger a close + reopen + full initialize on every tick. */
 #define REFRESH_FAIL_RETRY_EVERY 4
 #define TRAY_RETRY_INTERVAL_MS 2000
 #define WM_TRAYICON (WM_APP + 1)
@@ -117,6 +119,10 @@ typedef struct AppState {
     HWND overview_btn;
     HWND autostart_checkbox;
     HWND save_btn;
+    HWND update_label;   /* "Update" caption in the OPTIONS panel */
+    HWND update_slider;  /* poll-interval slider (0.5 s .. 5 s) */
+    HWND update_readout; /* "5.0 s" interval readout */
+    int update_ms;       /* current poll interval in ms */
     HWND status_label;
     /* GPU curve */
     HWND curve_hint;
@@ -748,6 +754,7 @@ static bool parse_curve_points(const wchar_t *text, int *temps, int *duties,
 static void load_global_settings(AppState *app)
 {
     HKEY key;
+    app->update_ms = UPDATE_DEFAULT_MS;
     if (!settings_open_existing_key(SETTINGS_KEY, &key, KEY_QUERY_VALUE) &&
         !settings_open_existing_key(LEGACY_SETTINGS_KEY, &key, KEY_QUERY_VALUE)) {
         app->saved_device_index = 0;
@@ -755,6 +762,7 @@ static void load_global_settings(AppState *app)
         return;
     }
 
+    app->update_ms = (int)settings_read_dword(key, L"UpdateMs", UPDATE_DEFAULT_MS);
     app->saved_device_index = (int)settings_read_dword(key, L"DeviceIndex", 0);
     settings_read_string(key, L"LastDeviceKey", app->last_device_key,
                          (DWORD)(sizeof(app->last_device_key) /
@@ -826,6 +834,7 @@ static void save_global_settings(AppState *app)
         return;
     }
 
+    settings_write_dword(key, L"UpdateMs", (DWORD)app->update_ms);
     int device_index = selected_device_index(app);
     if (device_index >= 0) {
         wchar_t device_key[32];
@@ -1063,6 +1072,49 @@ static void update_duty_label(AppState *app, int fan)
     swprintf(text, sizeof(text) / sizeof(text[0]), L"%d%%",
              ui_slider_value(app->fan_slider[fan]));
     SetWindowTextW(app->fan_duty[fan], text);
+}
+
+/* Slider position 0..100 <-> poll interval. 0 = slowest (UPDATE_MAX_MS),
+ * 100 = fastest (UPDATE_MIN_MS). The interval is quantised to 100 ms so the
+ * readout always lands on a clean tenth of a second. */
+static int update_ms_from_pos(int pos)
+{
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (pos > 100) {
+        pos = 100;
+    }
+    int raw = UPDATE_MAX_MS - (pos * (UPDATE_MAX_MS - UPDATE_MIN_MS)) / 100;
+    raw = (raw + 50) / 100 * 100;
+    if (raw < UPDATE_MIN_MS) {
+        raw = UPDATE_MIN_MS;
+    }
+    if (raw > UPDATE_MAX_MS) {
+        raw = UPDATE_MAX_MS;
+    }
+    return raw;
+}
+
+static int update_pos_from_ms(int ms)
+{
+    int pos = (UPDATE_MAX_MS - ms) * 100 / (UPDATE_MAX_MS - UPDATE_MIN_MS);
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (pos > 100) {
+        pos = 100;
+    }
+    return pos;
+}
+
+static void update_interval_label(AppState *app)
+{
+    wchar_t text[16];
+    int ms = app->update_ms;
+    swprintf(text, sizeof(text) / sizeof(text[0]), L"%d.%d s", ms / 1000,
+             (ms % 1000) / 100);
+    SetWindowTextW(app->update_readout, text);
 }
 
 static void update_gpu_status_view(AppState *app, const char *err)
@@ -1513,14 +1565,13 @@ static void refresh_status(AppState *app)
         char err[256] = { 0 };
 
         if (!is_fake_device(&controller->device)) {
-            /* The fake device (CFC_FAKE test path) performs no HID I/O and
-             * keeps the full 5 s cadence; only real controllers are
-             * rate-limited. */
-            if (controller->refresh_failed) {
-                if (app->poll_counter % REFRESH_FAIL_RETRY_EVERY != 0) {
-                    continue;
-                }
-            } else if (app->poll_counter % REFRESH_EVERY_TICKS != 0) {
+            /* Healthy controllers are read every tick, at the same interval
+             * as the GUI refresh. A controller whose last refresh failed is
+             * only retried every REFRESH_FAIL_RETRY_EVERY-th tick so a dead
+             * device does not trigger a close + reopen + full initialize on
+             * every tick. */
+            if (controller->refresh_failed &&
+                app->poll_counter % REFRESH_FAIL_RETRY_EVERY != 0) {
                 continue;
             }
         }
@@ -2421,23 +2472,44 @@ static void create_main_controls(AppState *app, HWND hwnd)
     SetWindowTextW(app->save_btn, L"Save settings");
     ui_button_set_variant(app->save_btn, UI_BTN_PRIMARY);
 
+    /* Update (poll) interval, adjustable 0.5 s .. 5 s. Sits in the OPTIONS
+     * panel; the footer stays on the window background. */
+    app->update_label = make_child(hwnd, WC_STATICW, L"Update", SS_LEFT,
+                                   x_r + ui_px(12), ui_px(540), ui_px(52), ui_px(16),
+                                   0);
+    ui_register_font_role(app->update_label, UI_FONT_CAPTION);
+    ui_register_ctrl(app->update_label, UI_BG_PANEL, t->dim);
+    app->update_slider = ui_make_control(hwnd, UI_CLASS_SLIDER, WS_TABSTOP,
+                                         x_r + ui_px(72), ui_px(538), ui_px(116),
+                                         ui_px(24), IDC_UPDATE_INTERVAL);
+    app->update_readout = make_child(hwnd, WC_STATICW, L"5.0 s", SS_RIGHT,
+                                     x_r + ui_px(196), ui_px(540), ui_px(56),
+                                     ui_px(16), 0);
+    ui_register_font_role(app->update_readout, UI_FONT_MONO_BOLD);
+    ui_register_ctrl(app->update_readout, UI_BG_PANEL, t->text);
+
     /* Footer ------------------------------------------------------------- */
     app->device_combo = ui_make_control(hwnd, UI_CLASS_COMBO, WS_TABSTOP, ui_px(14),
                                         ui_px(616), ui_px(210), ui_px(28),
                                         IDC_DEVICE_COMBO);
+    ui_set_corner_bg(app->device_combo, t->ink);
     app->scan_btn = ui_make_control(hwnd, UI_CLASS_BUTTON, WS_TABSTOP, ui_px(234),
                                     ui_px(616), ui_px(70), ui_px(28), IDC_SCAN);
     SetWindowTextW(app->scan_btn, L"Scan");
+    ui_set_corner_bg(app->scan_btn, t->ink);
     app->refresh_btn = ui_make_control(hwnd, UI_CLASS_BUTTON, WS_TABSTOP, ui_px(314),
                                        ui_px(616), ui_px(80), ui_px(28), IDC_REFRESH);
     SetWindowTextW(app->refresh_btn, L"Refresh");
+    ui_set_corner_bg(app->refresh_btn, t->ink);
     app->apply_all_btn = ui_make_control(hwnd, UI_CLASS_BUTTON, WS_TABSTOP, ui_px(404),
                                          ui_px(616), ui_px(84), ui_px(28),
                                          IDC_APPLY_ALL);
     SetWindowTextW(app->apply_all_btn, L"Apply all");
+    ui_set_corner_bg(app->apply_all_btn, t->ink);
     app->overview_btn = ui_make_control(hwnd, UI_CLASS_BUTTON, WS_TABSTOP, ui_px(498),
                                         ui_px(616), ui_px(84), ui_px(28), IDC_OVERVIEW);
     SetWindowTextW(app->overview_btn, L"Overview");
+    ui_set_corner_bg(app->overview_btn, t->ink);
 
     app->status_label = make_child(hwnd, WC_STATICW, L"Scan for devices.", SS_LEFT,
                                    ui_px(14), ui_px(650), ui_px(700), ui_px(16),
@@ -2463,6 +2535,9 @@ static void create_main_controls(AppState *app, HWND hwnd)
                     SWP_NOMOVE | SWP_NOSIZE);
 
     load_global_settings(app);
+    app->update_ms = clamp_int(app->update_ms, UPDATE_MIN_MS, UPDATE_MAX_MS);
+    ui_slider_set(app->update_slider, update_pos_from_ms(app->update_ms));
+    update_interval_label(app);
     refresh_gpu_status(app);
     update_controls_enabled(app);
     update_device_subtitle(app);
@@ -2565,14 +2640,14 @@ static void layout_main(AppState *app)
     }
 
     /* Right column. */
-    int curve_h = body_h * 52 / 100;
-    if (curve_h < ui_px(236)) {
-        curve_h = ui_px(236);
-    }
     int ctrl_h = ui_px(150);
-    int opts_h = body_h - curve_h - ctrl_h - gap * 2;
-    if (opts_h < ui_px(98)) {
-        opts_h = ui_px(98);
+    /* The OPTIONS panel is sized to its content (heading + checkbox +
+     * interval slider + save button); the GPU curve absorbs the remaining
+     * height so the interval control always fits without being crammed. */
+    int opts_h = ui_px(134);
+    int curve_h = body_h - opts_h - ctrl_h - gap * 2;
+    if (curve_h < ui_px(200)) {
+        curve_h = ui_px(200);
     }
 
     MoveWindow(app->curve_panel, x_r, body_top, right_w, curve_h, TRUE);
@@ -2609,8 +2684,14 @@ static void layout_main(AppState *app)
     MoveWindow(app->options_panel, x_r, options_top, right_w, opts_h, TRUE);
     MoveWindow(app->options_heading, x_r + ui_px(12), options_top + ui_px(10),
                ui_px(160), ui_px(16), TRUE);
-    MoveWindow(app->autostart_checkbox, x_r + ui_px(12), options_top + ui_px(34),
+    MoveWindow(app->autostart_checkbox, x_r + ui_px(12), options_top + ui_px(32),
                ui_px(180), ui_px(20), TRUE);
+    MoveWindow(app->update_label, x_r + ui_px(12), options_top + ui_px(64), ui_px(52),
+               ui_px(16), TRUE);
+    MoveWindow(app->update_slider, x_r + ui_px(72), options_top + ui_px(62), ui_px(116),
+               ui_px(24), TRUE);
+    MoveWindow(app->update_readout, x_r + right_w - ui_px(68), options_top + ui_px(64),
+               ui_px(56), ui_px(16), TRUE);
     MoveWindow(app->save_btn, x_r + ui_px(12), options_top + opts_h - ui_px(38),
                right_w - ui_px(24), ui_px(28), TRUE);
 
@@ -2658,7 +2739,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         GetClientRect(hwnd, &client);
         layout_main(app);
         scan_devices(app);
-        SetTimer(hwnd, REFRESH_TIMER, POLL_INTERVAL_MS, NULL);
+        SetTimer(hwnd, REFRESH_TIMER, app->update_ms, NULL);
         return 0;
 
     case WM_COMMAND: {
@@ -2760,6 +2841,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         return 0;
 
     case WM_HSCROLL:
+        if ((HWND)lparam == app->update_slider) {
+            app->update_ms = update_ms_from_pos(ui_slider_value(app->update_slider));
+            update_interval_label(app);
+            SetTimer(hwnd, REFRESH_TIMER, app->update_ms, NULL);
+            if (LOWORD(wparam) == TB_ENDTRACK || LOWORD(wparam) == SB_ENDSCROLL) {
+                save_global_settings(app);
+            }
+            return 0;
+        }
         for (int i = 0; i < CORSAIR_FAN_COUNT; ++i) {
             if ((HWND)lparam == app->fan_slider[i]) {
                 update_duty_label(app, i);
